@@ -1,8 +1,11 @@
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+
+logger = logging.getLogger("kr.api")
 
 from ..core.dependencies import get_db, get_current_user
 from ..core.config import settings
@@ -178,7 +181,6 @@ async def login_with_google(
     try:
         from google.oauth2 import id_token as google_id_token
         from google.auth.transport import requests as google_requests
-        import logging
 
         idinfo = google_id_token.verify_oauth2_token(
             payload.id_token,
@@ -186,13 +188,13 @@ async def login_with_google(
             settings.GOOGLE_CLIENT_ID,
         )
     except ValueError as e:
-        logging.getLogger("kr.api").warning("Google token verify failed: %s", e)
+        logger.warning("Google token verify failed: %s", e)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Google sign-in token",
         )
     except Exception as e:
-        logging.getLogger("kr.api").exception("Google token verify error: %s", e)
+        logger.exception("Google token verify error: %s", e)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not verify Google sign-in",
