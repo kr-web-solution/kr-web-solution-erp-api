@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.production.example
+!.env.example
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+uploads
+*.md
+tests
+.pytest_cache
+_verify_users.py
