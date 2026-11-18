@@ -13,12 +13,40 @@ from ..core.security import (
 )
 from ..models import User, Settings, EmailTemplate
 from ..schemas import (
-    LoginRequest, LoginResponse, UserResponse, MeUpdate,
+    LoginRequest, GoogleLoginRequest, LoginResponse, UserResponse, MeUpdate,
     ForgotPasswordRequest, ResetPasswordRequest
 )
 from ..services.email import send_email_async
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+def _set_auth_cookie(response: Response, access_token: str) -> None:
+    response.set_cookie(
+        key=settings.COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        expires=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+        samesite="lax",
+        secure=settings.PRODUCTION,
+    )
+
+
+def _login_response_for(user: User, response: Response) -> LoginResponse:
+    access_token = create_access_token(
+        subject=user.id,
+        role=user.role,
+        extra_claims={"client_id": user.client_id, "email": user.email},
+    )
+    _set_auth_cookie(response, access_token)
+    return LoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+    )
+
 
 @router.post("/login", response_model=LoginResponse)
 async def login(
@@ -41,30 +69,80 @@ async def login(
             detail="User account is inactive"
         )
 
-    # Create access token
-    access_token = create_access_token(
-        subject=user.id,
-        role=user.role,
-        extra_claims={"client_id": user.client_id, "email": user.email}
-    )
+    return _login_response_for(user, response)
 
-    # Set httpOnly cookie with root path scope
-    response.set_cookie(
-        key=settings.COOKIE_NAME,
-        value=access_token,
-        httponly=True,
-        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        expires=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        path="/",
-        samesite="lax",
-        secure=settings.PRODUCTION
-    )
 
-    return LoginResponse(
-        access_token=access_token,
-        token_type="bearer",
-        user=UserResponse.model_validate(user)
-    )
+@router.post("/google", response_model=LoginResponse)
+async def login_with_google(
+    payload: GoogleLoginRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Verify Google ID token and issue the same JWT cookie as password login.
+
+    Only existing active users may sign in — no auto-registration.
+    """
+    if not settings.GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google sign-in is not configured",
+        )
+
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+
+        idinfo = google_id_token.verify_oauth2_token(
+            payload.id_token,
+            google_requests.Request(),
+            settings.GOOGLE_CLIENT_ID,
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Google sign-in token",
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not verify Google sign-in",
+        )
+
+    if idinfo.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Google token issuer",
+        )
+
+    email = (idinfo.get("email") or "").lower().strip()
+    email_verified = bool(idinfo.get("email_verified"))
+    if not email or not email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Google account email is not verified",
+        )
+
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No KR Workspace account for this Google email. Ask a founder to invite you first.",
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive",
+        )
+
+    # Refresh display name from Google if ours is empty/generic
+    google_name = (idinfo.get("name") or "").strip()
+    if google_name and (not user.full_name or user.full_name.lower() in ("founder ceo", "user")):
+        user.full_name = google_name
+        await db.commit()
+        await db.refresh(user)
+
+    return _login_response_for(user, response)
 
 @router.post("/logout")
 async def logout(response: Response):

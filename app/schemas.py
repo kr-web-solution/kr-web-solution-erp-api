@@ -11,6 +11,11 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+
+class GoogleLoginRequest(BaseModel):
+    id_token: str = Field(min_length=20)
+
+
 class UserResponse(OrmBase):
     id: str
     email: str

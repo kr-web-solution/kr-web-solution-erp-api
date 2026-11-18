@@ -58,4 +58,8 @@ class Settings(BaseSettings):
     S3_REGION: str = "ap-south-1"
     S3_CONSOLE_CORS_ORIGINS: Optional[str] = None
 
+    # Google OAuth (Sign in with Google — ID token verification)
+    GOOGLE_CLIENT_ID: Optional[str] = None
+    GOOGLE_CLIENT_SECRET: Optional[str] = None
+
 settings = Settings()
