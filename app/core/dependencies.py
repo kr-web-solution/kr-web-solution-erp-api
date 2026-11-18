@@ -4,7 +4,8 @@ from fastapi import Request, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from .database import AsyncSessionLocal
+from sqlalchemy.orm import selectinload
+from .database import AsyncSessionLocal, not_deleted
 from .config import settings
 from .security import decode_access_token
 from ..models import User
@@ -51,7 +52,15 @@ async def get_current_user(
         )
 
     user_id = payload["sub"]
-    result = await db.execute(select(User).where(User.id == user_id))
+    result = await db.execute(
+        select(User)
+        .options(
+            selectinload(User.role_row),
+            selectinload(User.client),
+            selectinload(User.lead),
+        )
+        .where(User.id == user_id, not_deleted(User))
+    )
     user = result.scalars().first()
 
     if not user or not user.is_active:

@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
+from ..core.database import not_deleted
 from ..models import Note, User, Client, Lead
 from ..schemas import NoteResponse, NoteCreate
 
@@ -26,7 +27,7 @@ async def list_notes(
     stmt = (
         select(Note)
         .options(selectinload(Note.author))
-        .where(Note.entity_type == entity_type, Note.entity_id == entity_id)
+        .where(Note.entity_type == entity_type, Note.entity_id == entity_id, not_deleted(Note))
         .order_by(Note.created_at.desc())
     )
     res = await db.execute(stmt)
@@ -71,7 +72,7 @@ async def delete_note(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    res = await db.execute(select(Note).where(Note.id == note_id))
+    res = await db.execute(select(Note).where(Note.id == note_id, not_deleted(Note)))
     note = res.scalars().first()
     if not note:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
@@ -79,6 +80,6 @@ async def delete_note(
     if not is_privileged(current_user.role) and note.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-    await db.delete(note)
+    note.soft_delete()
     await db.commit()
     return {"message": "Note deleted successfully"}

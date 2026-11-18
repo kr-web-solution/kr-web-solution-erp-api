@@ -1,14 +1,16 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from ..core.dependencies import get_db, require_founder_ceo
+from ..core.database import not_deleted
 from ..models import Lead, Client, Project, User
 from ..schemas import (
     LeadResponse, LeadCreate, LeadUpdate,
     LeadConvertRequest, LeadConvertResponse
 )
+from ..services.audit import audit_create, audit_soft_delete, audit_update, snapshot_entity
 
 router = APIRouter(prefix="/leads", tags=["Leads (Founder Only)"])
 
@@ -19,7 +21,7 @@ async def list_leads(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = select(Lead).order_by(Lead.created_at.desc())
+    stmt = select(Lead).where(not_deleted(Lead)).order_by(Lead.created_at.desc())
     if status and status != "all":
         stmt = stmt.where(Lead.status == status)
     if search:
@@ -35,7 +37,7 @@ async def get_lead(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Lead).where(Lead.id == lead_id))
+    res = await db.execute(select(Lead).where(Lead.id == lead_id, not_deleted(Lead)))
     lead = res.scalars().first()
     if not lead:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
@@ -44,11 +46,14 @@ async def get_lead(
 @router.post("", response_model=LeadResponse, status_code=status.HTTP_201_CREATED)
 async def create_lead(
     payload: LeadCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
     lead = Lead(**payload.model_dump())
     db.add(lead)
+    await db.flush()
+    await audit_create(db, lead, actor_id=current_user.id, request=request)
     await db.commit()
     await db.refresh(lead)
     return LeadResponse.model_validate(lead)
@@ -57,17 +62,20 @@ async def create_lead(
 async def update_lead(
     lead_id: str,
     payload: LeadUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Lead).where(Lead.id == lead_id))
+    res = await db.execute(select(Lead).where(Lead.id == lead_id, not_deleted(Lead)))
     lead = res.scalars().first()
     if not lead:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
 
+    before = snapshot_entity(lead)
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(lead, k, v)
 
+    await audit_update(db, lead, before, actor_id=current_user.id, request=request)
     await db.commit()
     await db.refresh(lead)
     return LeadResponse.model_validate(lead)
@@ -75,15 +83,17 @@ async def update_lead(
 @router.delete("/{lead_id}", status_code=status.HTTP_200_OK)
 async def delete_lead(
     lead_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Lead).where(Lead.id == lead_id))
+    res = await db.execute(select(Lead).where(Lead.id == lead_id, not_deleted(Lead)))
     lead = res.scalars().first()
     if not lead:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
 
-    await db.delete(lead)
+    lead.soft_delete()
+    await audit_soft_delete(db, lead, actor_id=current_user.id, request=request)
     await db.commit()
     return {"message": "Lead deleted successfully"}
 
@@ -95,7 +105,7 @@ async def convert_lead(
     _: User = Depends(require_founder_ceo)
 ):
     """Transactionally convert a won lead into a Client and optional Project."""
-    res = await db.execute(select(Lead).where(Lead.id == lead_id))
+    res = await db.execute(select(Lead).where(Lead.id == lead_id, not_deleted(Lead)))
     lead = res.scalars().first()
     if not lead:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")

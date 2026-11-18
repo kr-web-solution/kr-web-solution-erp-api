@@ -6,6 +6,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo
+from ..core.database import not_deleted
 from ..models import Invoice, InvoiceItem, Client, Project, Settings, EmailTemplate, RecurringInvoice, User, LateFeeAction
 from ..schemas import (
     InvoiceResponse, InvoiceCreate, InvoiceUpdate, InvoiceItemResponse,
@@ -109,6 +110,7 @@ async def list_invoices(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .where(not_deleted(Invoice))
         .order_by(Invoice.created_at.desc())
     )
 
@@ -550,7 +552,7 @@ async def delete_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = select(Invoice).where(Invoice.id == invoice_id)
+    stmt = select(Invoice).where(Invoice.id == invoice_id, not_deleted(Invoice))
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
@@ -558,7 +560,7 @@ async def delete_invoice(
     if inv.status == "paid":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete paid invoice")
 
-    await db.delete(inv)
+    inv.soft_delete()
     await db.commit()
     return {"message": "Invoice deleted successfully"}
 

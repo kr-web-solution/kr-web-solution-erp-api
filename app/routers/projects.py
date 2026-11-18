@@ -7,6 +7,7 @@ from sqlalchemy import select, delete, func  # noqa: F401 — delete used in upd
 from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
+from ..core.database import not_deleted
 from ..common.workflow import DELIVERY_MAX_STAGE, DELIVERY_MIN_STAGE, WARRANTY_DEFAULT_DAYS
 from ..models import (
     Project,
@@ -174,6 +175,7 @@ async def list_projects(
             selectinload(Project.workers),
             selectinload(Project.recurring_invoices)
         )
+        .where(not_deleted(Project))
         .order_by(Project.created_at.desc())
     )
 
@@ -743,12 +745,12 @@ async def delete_project(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Project).where(Project.id == project_id))
+    res = await db.execute(select(Project).where(Project.id == project_id, not_deleted(Project)))
     project = res.scalars().first()
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 
-    await db.delete(project)
+    project.soft_delete()
     await db.commit()
     return {"message": "Project deleted successfully"}
 

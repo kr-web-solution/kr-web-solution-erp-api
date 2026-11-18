@@ -13,6 +13,11 @@ from ..models import (
     Settings as SettingsModel,
     EmailTemplate,
 )
+from ..core.roles_catalog import ROLE_ADMIN, ROLE_FOUNDER, ROLE_WORKER, ROLE_CLIENT
+from ..core.lookups_catalog import PARTY_TYPES
+from ..services.user_identity import ensure_roles_seeded, apply_role_to_user
+
+PARTY_ID_BY_CODE = {r["code"]: r["id"] for r in PARTY_TYPES}
 
 
 # Fixed demo login accounts (documented in README)
@@ -78,8 +83,39 @@ async def purge_business_data(session) -> None:
     )
 
 
+def _make_user(
+    *,
+    user_id: str,
+    email: str,
+    password: str,
+    full_name: str,
+    role_code: str,
+    client_id: str | None = None,
+    lead_id: str | None = None,
+    phone: str | None = None,
+    designation: str | None = None,
+) -> User:
+    user = User(
+        id=user_id,
+        email=email,
+        password_hash=get_password_hash(password),
+        full_name=full_name,
+        phone=phone,
+        designation=designation,
+        is_active=True,
+        role_id="rol_worker",
+        role="worker",
+        party_type="staff",
+        party_type_id=PARTY_ID_BY_CODE["staff"],
+    )
+    apply_role_to_user(user, role_code, client_id=client_id, lead_id=lead_id)
+    return user
+
+
 async def seed_login_accounts(session) -> None:
     """Ensure admin + client org + worker + client-portal logins exist."""
+    await ensure_roles_seeded(session)
+
     existing_client = (
         await session.execute(select(Client).where(Client.id == CLIENT_ID))
     ).scalars().first()
@@ -103,19 +139,18 @@ async def seed_login_accounts(session) -> None:
     ).scalars().first()
     if not admin:
         session.add(
-            User(
-                id=ADMIN_USER_ID,
+            _make_user(
+                user_id=ADMIN_USER_ID,
                 email=ADMIN_EMAIL,
-                password_hash=get_password_hash(ADMIN_PASSWORD),
+                password=ADMIN_PASSWORD,
                 full_name="Workspace Admin",
-                role="admin",
-                is_active=True,
+                role_code=ROLE_ADMIN,
             )
         )
     else:
         admin.password_hash = get_password_hash(ADMIN_PASSWORD)
         admin.full_name = "Workspace Admin"
-        admin.role = "admin"
+        apply_role_to_user(admin, ROLE_ADMIN)
         admin.is_active = True
 
     worker = (
@@ -123,18 +158,19 @@ async def seed_login_accounts(session) -> None:
     ).scalars().first()
     if not worker:
         session.add(
-            User(
-                id=WORKER_ID,
+            _make_user(
+                user_id=WORKER_ID,
                 email=WORKER_EMAIL,
-                password_hash=get_password_hash(WORKER_PASSWORD),
+                password=WORKER_PASSWORD,
                 full_name="Vignesh Kumar",
-                role="worker",
-                is_active=True,
+                role_code=ROLE_WORKER,
+                phone="+91 90000 10002",
+                designation="Developer",
             )
         )
     else:
         worker.password_hash = get_password_hash(WORKER_PASSWORD)
-        worker.role = "worker"
+        apply_role_to_user(worker, ROLE_WORKER)
         worker.is_active = True
 
     client_user = (
@@ -142,20 +178,20 @@ async def seed_login_accounts(session) -> None:
     ).scalars().first()
     if not client_user:
         session.add(
-            User(
-                id=CLIENT_USER_ID,
+            _make_user(
+                user_id=CLIENT_USER_ID,
                 email=CLIENT_EMAIL,
-                password_hash=get_password_hash(CLIENT_PASSWORD),
+                password=CLIENT_PASSWORD,
                 full_name="Priya Natarajan",
-                role="client",
+                role_code=ROLE_CLIENT,
                 client_id=CLIENT_ID,
-                is_active=True,
+                phone="+91 98765 41001",
+                designation="Operations Lead",
             )
         )
     else:
         client_user.password_hash = get_password_hash(CLIENT_PASSWORD)
-        client_user.role = "client"
-        client_user.client_id = CLIENT_ID
+        apply_role_to_user(client_user, ROLE_CLIENT, client_id=CLIENT_ID)
         client_user.is_active = True
 
 
@@ -234,6 +270,8 @@ async def seed_database_async():
                     existing.subject = subj
                     existing.body = body
 
+        await ensure_roles_seeded(session)
+
         # 3. Founder CEO
         founder_email = settings.FIRST_SUPERUSER_EMAIL or os.environ.get("FIRST_SUPERUSER_EMAIL")
         founder_pwd = settings.FIRST_SUPERUSER_PASSWORD or os.environ.get("FIRST_SUPERUSER_PASSWORD")
@@ -242,18 +280,18 @@ async def seed_database_async():
             founder = u_res.scalars().first()
             if not founder:
                 session.add(
-                    User(
-                        id="usr_founder",
+                    _make_user(
+                        user_id="usr_founder",
                         email=founder_email,
-                        password_hash=get_password_hash(founder_pwd),
+                        password=founder_pwd,
                         full_name=settings.FIRST_SUPERUSER_NAME or "Karthik Raja",
-                        role="founder_ceo",
-                        is_active=True,
+                        role_code=ROLE_FOUNDER,
+                        designation="Founder CEO",
                     )
                 )
             else:
                 founder.password_hash = get_password_hash(founder_pwd)
-                founder.role = "founder_ceo"
+                apply_role_to_user(founder, ROLE_FOUNDER)
                 founder.is_active = True
             await session.flush()
 
@@ -276,17 +314,18 @@ async def wipe_and_reseed_logins_async() -> None:
             founder = u_res.scalars().first()
             if not founder:
                 session.add(
-                    User(
-                        id="usr_founder",
+                    _make_user(
+                        user_id="usr_founder",
                         email=founder_email,
-                        password_hash=get_password_hash(founder_pwd),
+                        password=founder_pwd,
                         full_name=settings.FIRST_SUPERUSER_NAME or "Karthik Raja",
-                        role="founder_ceo",
-                        is_active=True,
+                        role_code=ROLE_FOUNDER,
+                        designation="Founder CEO",
                     )
                 )
             else:
                 founder.password_hash = get_password_hash(founder_pwd)
+                apply_role_to_user(founder, ROLE_FOUNDER)
                 founder.is_active = True
         await seed_login_accounts(session)
         await session.commit()

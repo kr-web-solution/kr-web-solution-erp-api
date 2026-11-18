@@ -17,6 +17,7 @@ from ..schemas import (
     ForgotPasswordRequest, ResetPasswordRequest
 )
 from ..services.email import send_email_async
+from ..services.user_identity import to_user_response, get_user_with_party
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -34,17 +35,38 @@ def _set_auth_cookie(response: Response, access_token: str) -> None:
     )
 
 
-def _login_response_for(user: User, response: Response) -> LoginResponse:
+async def _login_response_for(
+    user: User, response: Response, db: AsyncSession
+) -> LoginResponse:
+    loaded = await get_user_with_party(db, user.id) or user
     access_token = create_access_token(
-        subject=user.id,
-        role=user.role,
-        extra_claims={"client_id": user.client_id, "email": user.email},
+        subject=loaded.id,
+        role=loaded.role,
+        extra_claims={
+            "client_id": loaded.client_id,
+            "lead_id": loaded.lead_id,
+            "party_type": loaded.party_type,
+            "email": loaded.email,
+        },
     )
     _set_auth_cookie(response, access_token)
     return LoginResponse(
         access_token=access_token,
         token_type="bearer",
-        user=UserResponse.model_validate(user),
+        user=to_user_response(loaded) if loaded.role_row is not None else UserResponse(
+            id=loaded.id,
+            email=loaded.email,
+            full_name=loaded.full_name,
+            role=loaded.role,
+            role_id=loaded.role_id,
+            party_type=loaded.party_type,
+            client_id=loaded.client_id,
+            lead_id=loaded.lead_id,
+            is_active=loaded.is_active,
+            phone=loaded.phone,
+            designation=loaded.designation or loaded.job_title,
+            created_at=loaded.created_at,
+        ),
     )
 
 
@@ -69,7 +91,7 @@ async def login(
             detail="User account is inactive"
         )
 
-    return _login_response_for(user, response)
+    return await _login_response_for(user, response, db)
 
 
 @router.post("/google", response_model=LoginResponse)
@@ -142,7 +164,7 @@ async def login_with_google(
         await db.commit()
         await db.refresh(user)
 
-    return _login_response_for(user, response)
+    return await _login_response_for(user, response, db)
 
 @router.post("/logout")
 async def logout(response: Response):
@@ -157,7 +179,7 @@ async def logout(response: Response):
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
-    return UserResponse.model_validate(current_user)
+    return to_user_response(current_user)
 
 
 @router.patch("/me", response_model=UserResponse)
@@ -190,8 +212,8 @@ async def update_me(
         current_user.password_hash = get_password_hash(new_password)
 
     await db.commit()
-    await db.refresh(current_user)
-    return UserResponse.model_validate(current_user)
+    loaded = await get_user_with_party(db, current_user.id) or current_user
+    return to_user_response(loaded)
 
 
 @router.post("/forgot-password")

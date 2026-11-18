@@ -1,12 +1,14 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo
+from ..core.database import not_deleted
 from ..models import Client, Project, Invoice, User
 from ..schemas import ClientResponse, ClientCreate, ClientUpdate
+from ..services.audit import audit_create, audit_soft_delete, audit_update, snapshot_entity
 
 router = APIRouter(prefix="/clients", tags=["Clients"])
 
@@ -44,19 +46,19 @@ async def list_clients(
     if current_user.role == "client":
         if not current_user.client_id:
             return []
-        stmt = select(Client).where(Client.id == current_user.client_id)
+        stmt = select(Client).where(Client.id == current_user.client_id, not_deleted(Client))
     elif current_user.role == "worker":
         # Workers see clients of projects assigned to them
         stmt = (
             select(Client)
             .join(Project, Project.client_id == Client.id)
             .join(Project.workers)
-            .where(User.id == current_user.id)
+            .where(User.id == current_user.id, not_deleted(Client), not_deleted(Project))
             .distinct()
         )
     else:
         # founder_ceo sees all
-        stmt = select(Client).order_by(Client.name.asc())
+        stmt = select(Client).where(not_deleted(Client)).order_by(Client.name.asc())
 
     res = await db.execute(stmt)
     clients = res.scalars().all()
@@ -64,8 +66,12 @@ async def list_clients(
     # Calculate counts
     response_list = []
     for cl in clients:
-        p_cnt = await db.scalar(select(func.count()).select_from(Project).where(Project.client_id == cl.id))
-        i_cnt = await db.scalar(select(func.count()).select_from(Invoice).where(Invoice.client_id == cl.id))
+        p_cnt = await db.scalar(
+            select(func.count()).select_from(Project).where(Project.client_id == cl.id, not_deleted(Project))
+        )
+        i_cnt = await db.scalar(
+            select(func.count()).select_from(Invoice).where(Invoice.client_id == cl.id, not_deleted(Invoice))
+        )
         resp = ClientResponse.model_validate(cl)
         resp.projects_count = p_cnt or 0
         resp.invoices_count = i_cnt or 0
@@ -82,13 +88,17 @@ async def get_client(
     if current_user.role == "client" and current_user.client_id != client_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-    res = await db.execute(select(Client).where(Client.id == client_id))
+    res = await db.execute(select(Client).where(Client.id == client_id, not_deleted(Client)))
     client = res.scalars().first()
     if not client:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 
-    p_cnt = await db.scalar(select(func.count()).select_from(Project).where(Project.client_id == client.id))
-    i_cnt = await db.scalar(select(func.count()).select_from(Invoice).where(Invoice.client_id == client.id))
+    p_cnt = await db.scalar(
+        select(func.count()).select_from(Project).where(Project.client_id == client.id, not_deleted(Project))
+    )
+    i_cnt = await db.scalar(
+        select(func.count()).select_from(Invoice).where(Invoice.client_id == client.id, not_deleted(Invoice))
+    )
     resp = ClientResponse.model_validate(client)
     resp.projects_count = p_cnt or 0
     resp.invoices_count = i_cnt or 0
@@ -97,11 +107,14 @@ async def get_client(
 @router.post("", response_model=ClientResponse, status_code=status.HTTP_201_CREATED)
 async def create_client(
     payload: ClientCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
     client = Client(**_clean_client_payload(payload.model_dump(), fill_billing_email=True))
     db.add(client)
+    await db.flush()
+    await audit_create(db, client, actor_id=current_user.id, request=request)
     await db.commit()
     await db.refresh(client)
     resp = ClientResponse.model_validate(client)
@@ -113,22 +126,29 @@ async def create_client(
 async def update_client(
     client_id: str,
     payload: ClientUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Client).where(Client.id == client_id))
+    res = await db.execute(select(Client).where(Client.id == client_id, not_deleted(Client)))
     client = res.scalars().first()
     if not client:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 
+    before = snapshot_entity(client)
     for k, v in _clean_client_payload(payload.model_dump(exclude_unset=True)).items():
         setattr(client, k, v)
 
+    await audit_update(db, client, before, actor_id=current_user.id, request=request)
     await db.commit()
     await db.refresh(client)
 
-    p_cnt = await db.scalar(select(func.count()).select_from(Project).where(Project.client_id == client.id))
-    i_cnt = await db.scalar(select(func.count()).select_from(Invoice).where(Invoice.client_id == client.id))
+    p_cnt = await db.scalar(
+        select(func.count()).select_from(Project).where(Project.client_id == client.id, not_deleted(Project))
+    )
+    i_cnt = await db.scalar(
+        select(func.count()).select_from(Invoice).where(Invoice.client_id == client.id, not_deleted(Invoice))
+    )
     resp = ClientResponse.model_validate(client)
     resp.projects_count = p_cnt or 0
     resp.invoices_count = i_cnt or 0
@@ -137,15 +157,17 @@ async def update_client(
 @router.delete("/{client_id}", status_code=status.HTTP_200_OK)
 async def delete_client(
     client_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Client).where(Client.id == client_id))
+    res = await db.execute(select(Client).where(Client.id == client_id, not_deleted(Client)))
     client = res.scalars().first()
     if not client:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 
-    await db.delete(client)
+    client.soft_delete()
+    await audit_soft_delete(db, client, actor_id=current_user.id, request=request)
     await db.commit()
     return {"message": "Client deleted successfully"}
 

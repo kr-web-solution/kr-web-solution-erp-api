@@ -16,14 +16,50 @@ class GoogleLoginRequest(BaseModel):
     id_token: str = Field(min_length=20)
 
 
+class RoleBrief(OrmBase):
+    id: str
+    code: str
+    name: str
+    party_type: str  # staff | client | lead
+    description: Optional[str] = None
+
+
+class ClientPartyBrief(OrmBase):
+    id: str
+    name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    gstin: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+
+
+class LeadPartyBrief(OrmBase):
+    id: str
+    name: str
+    company: str
+    contact_name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    status: str
+
+
 class UserResponse(OrmBase):
     id: str
     email: str
     full_name: str
-    role: str  # "admin", "founder_ceo", "worker", "client"
+    role: str  # roles.code
+    role_id: str
+    party_type: str  # staff | client | lead
     client_id: Optional[str] = None
+    lead_id: Optional[str] = None
     is_active: bool
+    phone: Optional[str] = None
+    designation: Optional[str] = None
     created_at: datetime
+    role_info: Optional[RoleBrief] = None
+    client: Optional[ClientPartyBrief] = None
+    lead: Optional[LeadPartyBrief] = None
 
 class LoginResponse(BaseModel):
     access_token: str
@@ -34,8 +70,11 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6)
     full_name: str
-    role: str  # "admin", "founder_ceo", "worker", "client"
+    role: str  # admin | founder_ceo | worker | client | lead
     client_id: Optional[str] = None
+    lead_id: Optional[str] = None
+    phone: Optional[str] = None
+    designation: Optional[str] = None
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
@@ -43,6 +82,9 @@ class UserUpdate(BaseModel):
     is_active: Optional[bool] = None
     password: Optional[str] = None
     client_id: Optional[str] = None
+    lead_id: Optional[str] = None
+    phone: Optional[str] = None
+    designation: Optional[str] = None
 
 class MeUpdate(BaseModel):
     full_name: Optional[str] = None
