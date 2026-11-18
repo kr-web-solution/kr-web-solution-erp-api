@@ -1,0 +1,201 @@
+from datetime import datetime, timezone
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from ..core.database import AsyncSessionLocal
+from ..core.dependencies import get_db, get_current_user
+from ..core.config import settings
+from ..core.security import (
+    verify_password, get_password_hash,
+    create_access_token, create_password_reset_token, verify_password_reset_token
+)
+from ..models import User, Settings, EmailTemplate
+from ..schemas import (
+    LoginRequest, LoginResponse, UserResponse, MeUpdate,
+    ForgotPasswordRequest, ResetPasswordRequest
+)
+from ..services.email import send_email_async
+
+router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+@router.post("/login", response_model=LoginResponse)
+async def login(
+    credentials: LoginRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(select(User).where(User.email == credentials.email.lower().strip()))
+    user = result.scalars().first()
+
+    if not user or not verify_password(credentials.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password"
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive"
+        )
+
+    # Create access token
+    access_token = create_access_token(
+        subject=user.id,
+        role=user.role,
+        extra_claims={"client_id": user.client_id, "email": user.email}
+    )
+
+    # Set httpOnly cookie with root path scope
+    response.set_cookie(
+        key=settings.COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        expires=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+        samesite="lax",
+        secure=settings.PRODUCTION
+    )
+
+    return LoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user)
+    )
+
+@router.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie(
+        key=settings.COOKIE_NAME,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=settings.PRODUCTION
+    )
+    return {"message": "Logged out successfully"}
+
+@router.get("/me", response_model=UserResponse)
+async def get_me(current_user: User = Depends(get_current_user)):
+    return UserResponse.model_validate(current_user)
+
+
+@router.patch("/me", response_model=UserResponse)
+async def update_me(
+    payload: MeUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Any logged-in user can update their own name / password."""
+    data = payload.model_dump(exclude_unset=True)
+    if "full_name" in data and data["full_name"] is not None:
+        name = str(data["full_name"]).strip()
+        if not name:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Name cannot be empty")
+        current_user.full_name = name
+
+    if data.get("password"):
+        new_password = str(data["password"])
+        if len(new_password) < 8:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password must be at least 8 characters",
+            )
+        current_pw = data.get("current_password") or ""
+        if current_pw and not verify_password(current_pw, current_user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current password is incorrect",
+            )
+        current_user.password_hash = get_password_hash(new_password)
+
+    await db.commit()
+    await db.refresh(current_user)
+    return UserResponse.model_validate(current_user)
+
+
+@router.post("/forgot-password")
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    email = request.email.lower().strip()
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalars().first()
+
+    if not user:
+        # Prevent user enumeration: respond with success even if not found
+        return {"message": "If that email is registered, a password reset link has been dispatched."}
+
+    reset_token = create_password_reset_token(email)
+    reset_link = f"{settings.FRONTEND_URL}/reset-password?token={reset_token}"
+
+    # Load email settings & template
+    st_res = await db.execute(select(Settings).where(Settings.id == "default"))
+    st = st_res.scalars().first()
+
+    tpl_res = await db.execute(select(EmailTemplate).where(EmailTemplate.id == "password_reset"))
+    tpl = tpl_res.scalars().first()
+
+    if st and st.smtp_host:
+        from ..services.email_html import build_password_reset_email, fill_placeholders
+
+        subject_default, html, plain = build_password_reset_email(
+            company_name=st.company_name,
+            user_name=user.full_name,
+            reset_link=reset_link,
+            company_address=st.company_address or "",
+            company_logo_url=st.company_logo_url or "/brand/krws-mark.png",
+        )
+        subject = (
+            fill_placeholders(
+                tpl.subject,
+                {"company_name": st.company_name, "user_name": user.full_name},
+            )
+            if tpl and tpl.subject
+            else subject_default
+        )
+        try:
+            await send_email_async(
+                to_email=email,
+                subject=subject,
+                body=html,
+                plain_body=plain,
+                settings=st,
+                is_html=True,
+            )
+        except Exception:
+            # Don't crash if SMTP is not configured in dev
+            pass
+
+    return {
+        "message": "If that email is registered, a password reset link has been dispatched.",
+        "dev_reset_link": reset_link if not settings.PRODUCTION else None
+    }
+
+@router.post("/reset-password")
+async def reset_password(
+    request: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    email = verify_password_reset_token(request.token)
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token"
+        )
+
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    user.password_hash = get_password_hash(request.new_password)
+    await db.commit()
+    return {"message": "Password updated successfully. You can now log in."}
+

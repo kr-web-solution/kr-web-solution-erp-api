@@ -1,0 +1,65 @@
+# Environment & secrets — never commit
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.Python
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.dmypy.json
+dmypy.json
+
+# Coverage / test reports
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.cache/
+nosetests.xml
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+wheels/
+
+# Local uploads & generated media
+uploads/
+media/
+tmp/
+temp/
+*.log
+
+# Local databases (if used for smoke tests)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
