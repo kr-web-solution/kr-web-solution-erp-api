@@ -18,6 +18,8 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
+# Keep 8000 fixed so the UI rewrite (API_INTERNAL_URL:8000) always matches.
+# Dokploy may set PORT for its proxy; internal Docker networking still uses 8000.
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
