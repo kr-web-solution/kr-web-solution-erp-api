@@ -178,18 +178,21 @@ async def login_with_google(
     try:
         from google.oauth2 import id_token as google_id_token
         from google.auth.transport import requests as google_requests
+        import logging
 
         idinfo = google_id_token.verify_oauth2_token(
             payload.id_token,
             google_requests.Request(),
             settings.GOOGLE_CLIENT_ID,
         )
-    except ValueError:
+    except ValueError as e:
+        logging.getLogger("kr.api").warning("Google token verify failed: %s", e)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Google sign-in token",
         )
-    except Exception:
+    except Exception as e:
+        logging.getLogger("kr.api").exception("Google token verify error: %s", e)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not verify Google sign-in",
