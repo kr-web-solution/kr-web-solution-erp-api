@@ -56,10 +56,16 @@ class UserResponse(OrmBase):
     is_active: bool
     phone: Optional[str] = None
     designation: Optional[str] = None
+    department: Optional[str] = None
     created_at: datetime
     role_info: Optional[RoleBrief] = None
     client: Optional[ClientPartyBrief] = None
     lead: Optional[LeadPartyBrief] = None
+    password_set: bool = True
+    profile_completed: bool = False
+    missing_profile_fields: List[str] = Field(default_factory=list)
+    # Present only after invite create in non-production
+    dev_invite_link: Optional[str] = None
 
 class LoginResponse(BaseModel):
     access_token: str
@@ -67,8 +73,8 @@ class LoginResponse(BaseModel):
     user: UserResponse
 
 class UserCreate(BaseModel):
+    """Invite payload — no password; invite email sets it."""
     email: EmailStr
-    password: str = Field(min_length=6)
     full_name: str
     role: str  # admin | founder_ceo | worker | client | lead
     client_id: Optional[str] = None
@@ -90,6 +96,30 @@ class MeUpdate(BaseModel):
     full_name: Optional[str] = None
     password: Optional[str] = None
     current_password: Optional[str] = None
+
+
+class MeProfileUpdate(BaseModel):
+    """Progressive onboarding fields after invite."""
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    designation: Optional[str] = None
+    department: Optional[str] = None
+
+
+class SetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(min_length=8)
+
+
+class MicrosoftLoginRequest(BaseModel):
+    id_token: str = Field(min_length=20)
+
+
+class OAuthProvidersResponse(BaseModel):
+    """Public OAuth client IDs for the SPA (no secrets)."""
+    google_client_id: Optional[str] = None
+    microsoft_client_id: Optional[str] = None
+    microsoft_tenant_id: str = "common"
 
 
 class ForgotPasswordRequest(BaseModel):

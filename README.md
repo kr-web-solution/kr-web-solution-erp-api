@@ -57,7 +57,7 @@ kr-erp-api/
 │   │   └── users.py              # User account administration (Founder only)
 │   ├── schemas.py                # Pydantic v2 validation & response models
 │   ├── scripts/
-│   │   └── seed.py               # Settings + admin/founder/worker/client login seed
+│   │   └── seed.py               # Settings, templates, SUPER_ADMIN bootstrap (no dummy logins)
 │   └── services/
 │       ├── email.py              # Async SMTP sender with decrypted credentials
 │       ├── pdf.py                # ReportLab vector tax invoice PDF generator
@@ -114,27 +114,31 @@ COOKIE_NAME=kr_access_token
 # Fernet Key for AES-256 SMTP Password Encryption
 ENCRYPTION_KEY=Qlhs7DPpurqcfoT6JENui-kFxgVjkywqzwC-iEFcWwE=
 
-# Initial Superuser Seeding (Auto-created on empty database)
-FIRST_SUPERUSER_EMAIL=founder@krwebsolution.com
-FIRST_SUPERUSER_PASSWORD=AdminKR@2026
-FIRST_SUPERUSER_NAME="Karthik Raja"
+# Bootstrap SUPER_ADMIN (created only when users table is empty)
+# Gmail (any domain) allowed for this bootstrap account only.
+SUPER_ADMIN_EMAIL=krwebsolutiondev@gmail.com
+SUPER_ADMIN_NAME=KR WEB SOLUTION ADMIN
+SUPER_ADMIN_PASSWORD=ChangeThisStrongPassword123!
+
+# Google Sign-In (invite-only — no auto-signup)
+GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-client-secret
+
+# Microsoft Entra ID / Outlook (invite-only)
+# Azure Portal → App registrations → SPA platform, redirect = FRONTEND_URL
+MICROSOFT_CLIENT_ID=
+MICROSOFT_TENANT_ID=common
+MICROSOFT_CLIENT_SECRET=
 
 # CORS Allowed Origins
 BACKEND_CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000"]
 ```
 
-**Login accounts** (seeded; no other demo CRM/ERP data):
+**Bootstrap login**: when the `users` table has no active rows, seed creates one `admin` from `SUPER_ADMIN_*`. There are **no** dummy seeded logins. Additional people are invited from Settings → People (set-password email). Staff emails must be `@krwebsolution.com`; client/lead emails must not use that domain.
 
-| Role | Email | Password |
-|------|-------|----------|
-| Admin | `admin@krwebsolution.com` | `AdminKR@2026` |
-| Founder CEO | `founder@krwebsolution.com` | `AdminKR@2026` |
-| Worker | `worker@krwebsolution.com` | `WorkerKR@2026` |
-| Client | `client@asterretail.com` | `ClientKR@2026` |
+UI does **not** need OAuth env vars. It calls `GET /api/v1/auth/oauth-providers` for public client IDs. Keep `GOOGLE_*` / `MICROSOFT_*` on the API only.
 
-These four accounts are the only seeded logins. Admin and Founder CEO share the same menus and actions.
-
-To wipe business data and reseed logins only: `python -c "import asyncio; from app.scripts.seed import wipe_and_reseed_logins_async; asyncio.run(wipe_and_reseed_logins_async())"`
+To soft-delete legacy dummy logins and bootstrap if empty: `python -c "import asyncio; from app.scripts.seed import wipe_and_reseed_logins_async; asyncio.run(wipe_and_reseed_logins_async())"`
 
 > [!IMPORTANT]
 > Never commit `.env` to source control. It is explicitly ignored in `.gitignore`.

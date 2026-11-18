@@ -738,6 +738,63 @@ def build_payment_received_email(
     return subject, html, plain
 
 
+def build_user_invite_email(
+    *,
+    company_name: str,
+    user_name: str,
+    invite_link: str,
+    role_label: str = "team member",
+    company_address: str = "",
+    company_logo_url: str = "",
+) -> Tuple[str, str, str]:
+    subject = f"You're invited to KR Workspace — set your password"
+    link = _e(invite_link)
+    body = "".join(
+        [
+            _greeting(user_name),
+            _p(
+                f"You have been invited to join <strong>{_e(company_name)}</strong> "
+                f"KR Workspace as <strong>{_e(role_label)}</strong>."
+            ),
+            _p("Set your password to activate your account. You can also sign in with Google or Microsoft once your password is set."),
+            f"""
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:20px 0;">
+              <tr>
+                <td style="background:{BRAND_RED};border-radius:10px;">
+                  <a href="{link}" style="display:inline-block;padding:12px 20px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">
+                    Set password
+                  </a>
+                </td>
+              </tr>
+            </table>
+            """,
+            _p(f'Or copy this link:<br/><a href="{link}" style="color:{BRAND_RED};word-break:break-all;">{link}</a>'),
+            _info_box(
+                "Expires in 72 hours",
+                "If this invite expires, ask your administrator to send a new one.",
+                "warn",
+            ),
+            f'<p style="margin:18px 0 0 0;color:{MUTED};font-size:13px;">Regards,<br/><strong style="color:{TEXT};">{_e(company_name)}</strong></p>',
+        ]
+    )
+    html = render_shell(
+        company_name=company_name,
+        company_address=company_address,
+        company_logo_url=company_logo_url,
+        preheader="Set your KR Workspace password",
+        title="You're invited",
+        eyebrow="Account invite",
+        body_html=body,
+    )
+    plain = (
+        f"Hi {user_name},\n\n"
+        f"You are invited to {company_name} KR Workspace as {role_label}.\n"
+        f"Set your password: {invite_link}\n\n"
+        f"This link expires in 72 hours.\n"
+    )
+    return subject, html, plain
+
+
 def build_password_reset_email(
     *,
     company_name: str,
@@ -962,6 +1019,11 @@ DEFAULT_EMAIL_TEMPLATES: List[Tuple[str, str, str]] = [
         "Password reset — {company_name}",
         "HTML_MANAGED:password_reset",
     ),
+    (
+        "user_invite",
+        "You're invited to KR Workspace — set your password",
+        "HTML_MANAGED:user_invite",
+    ),
 ]
 
 
@@ -997,6 +1059,14 @@ def template_preview_html(template_id: str, company_name: str = "KR Web Solution
             company_name=company_name,
             user_name="{user_name}",
             reset_link="{reset_link}",
+        )
+        return html
+    if template_id == "user_invite":
+        _, html, _ = build_user_invite_email(
+            company_name=company_name,
+            user_name="{user_name}",
+            invite_link="{invite_link}",
+            role_label="{role_label}",
         )
         return html
     if template_id == "lead_welcome":

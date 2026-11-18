@@ -78,6 +78,12 @@ def apply_role_to_user(
 
 
 def to_user_response(user: User) -> UserResponse:
+    from .profile_completion import (
+        is_profile_complete,
+        missing_profile_fields,
+        password_is_set,
+    )
+
     return UserResponse(
         id=user.id,
         email=user.email,
@@ -90,10 +96,14 @@ def to_user_response(user: User) -> UserResponse:
         is_active=user.is_active,
         phone=user.phone,
         designation=user.designation or user.job_title,
+        department=user.department,
         created_at=user.created_at,
         role_info=RoleBrief.model_validate(user.role_row) if user.role_row else None,
         client=ClientPartyBrief.model_validate(user.client) if user.client else None,
         lead=LeadPartyBrief.model_validate(user.lead) if user.lead else None,
+        password_set=password_is_set(user),
+        profile_completed=is_profile_complete(user),
+        missing_profile_fields=missing_profile_fields(user),
     )
 
 

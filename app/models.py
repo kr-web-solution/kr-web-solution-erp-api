@@ -128,6 +128,17 @@ class User(SoftDeleteMixin, TimestampMixin, Base):
     casual_leave_days: Mapped[int] = mapped_column(Integer, default=12, nullable=False)
     sick_leave_days: Mapped[int] = mapped_column(Integer, default=6, nullable=False)
 
+    # Auth / invite / progressive profile
+    password_set_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    profile_completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    invite_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
     # Relationships
     role_row: Mapped["Role"] = relationship("Role", back_populates="users")
     party_type_row: Mapped["PartyType"] = relationship("PartyType", foreign_keys=[party_type_id])

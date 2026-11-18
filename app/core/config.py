@@ -21,10 +21,14 @@ class Settings(BaseSettings):
     COOKIE_NAME: str = "kr_access_token"
     ENCRYPTION_KEY: str = "Qlhs7DPpurqcfoT6JENui-kFxgVjkywqzwC-iEFcWwE="
 
-    # Initial Superuser / Founder (Read strictly from env, no hardcoded default password)
+    # Bootstrap super admin (created only when users table is empty)
+    SUPER_ADMIN_EMAIL: Optional[str] = None
+    SUPER_ADMIN_PASSWORD: Optional[str] = None
+    SUPER_ADMIN_NAME: Optional[str] = "KR WEB SOLUTION ADMIN"
+    # Deprecated aliases (still accepted from old .env files)
     FIRST_SUPERUSER_EMAIL: Optional[str] = None
     FIRST_SUPERUSER_PASSWORD: Optional[str] = None
-    FIRST_SUPERUSER_NAME: Optional[str] = "Founder CEO"
+    FIRST_SUPERUSER_NAME: Optional[str] = None
 
     # Invoices & Notifications
     INVOICE_CC_EMAIL: Optional[str] = None
@@ -61,5 +65,27 @@ class Settings(BaseSettings):
     # Google OAuth (Sign in with Google — ID token verification)
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
+
+    # Microsoft Entra ID / Outlook (invite-only ID token verification)
+    MICROSOFT_CLIENT_ID: Optional[str] = None
+    MICROSOFT_TENANT_ID: str = "common"
+    MICROSOFT_CLIENT_SECRET: Optional[str] = None
+
+    @property
+    def bootstrap_admin_email(self) -> Optional[str]:
+        return self.SUPER_ADMIN_EMAIL or self.FIRST_SUPERUSER_EMAIL
+
+    @property
+    def bootstrap_admin_password(self) -> Optional[str]:
+        return self.SUPER_ADMIN_PASSWORD or self.FIRST_SUPERUSER_PASSWORD
+
+    @property
+    def bootstrap_admin_name(self) -> str:
+        return (
+            self.SUPER_ADMIN_NAME
+            or self.FIRST_SUPERUSER_NAME
+            or "KR WEB SOLUTION ADMIN"
+        )
+
 
 settings = Settings()

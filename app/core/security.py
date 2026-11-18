@@ -64,6 +64,34 @@ def verify_password_reset_token(token: str) -> Optional[str]:
     except Exception:
         return None
 
+
+def create_invite_token(email: str) -> str:
+    """72h token for first-time set-password after invite."""
+    expire = datetime.now(timezone.utc) + timedelta(hours=72)
+    payload = {
+        "sub": email,
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "purpose": "invite_set_password",
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def verify_invite_token(token: str) -> Optional[str]:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        if payload.get("purpose") != "invite_set_password":
+            return None
+        return payload.get("sub")
+    except Exception:
+        return None
+
+
+def unusable_password_hash() -> str:
+    """Hash that cannot match any user-typed password (invite pending)."""
+    import secrets
+    return get_password_hash(f"invite-pending-{secrets.token_urlsafe(32)}")
+
 # Fernet encryption for SMTP password at rest
 def _get_fernet() -> Fernet:
     try:
