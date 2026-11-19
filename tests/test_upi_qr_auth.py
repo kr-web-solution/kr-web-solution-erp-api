@@ -48,6 +48,9 @@ def authed_client():
 
 def test_upi_qr_requires_auth(client: TestClient):
     name = _ensure_dummy_qr()
+    # Session-scoped TestClient may retain login cookies from earlier tests
+    client.cookies.clear()
+    app.dependency_overrides.pop(get_current_user, None)
     res = client.get(f"/api/v1/settings/upi-qr-file/{name}")
     assert res.status_code in (401, 403)
 

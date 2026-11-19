@@ -12,6 +12,7 @@ from app.services.maintenance_billing import (
     create_project_amount_invoice,
 )
 from app.services.scheduler import step_a_generate_recurring_invoices, step_b_dispatch_due_reminders
+from tests.conftest import make_project_with_client
 
 
 def test_compute_prorata_golive_aug_10_inclusive():
@@ -37,16 +38,14 @@ async def test_create_prorata_idempotent_and_advances_next_run():
         client = (await session.execute(select(Client).limit(1))).scalars().first()
         assert client is not None
 
-        project = Project(
+        project = await make_project_with_client(
+            session,
             name="GoLive Stub Project",
             client_id=client.id,
             status="running",
             budget_paise=3000000,
-            advance_paise=1500000,
             go_live_at=None,
         )
-        session.add(project)
-        await session.flush()
 
         rec = RecurringInvoice(
             client_id=client.id,
@@ -113,15 +112,14 @@ async def test_scheduler_skips_before_golive_and_bills_after_stub():
         assert client is not None
         st = (await session.execute(select(Settings).where(Settings.id == "default"))).scalar_one()
 
-        project = Project(
+        project = await make_project_with_client(
+            session,
             name="Scheduler GoLive Gate",
             client_id=client.id,
             status="running",
             budget_paise=500000,
             go_live_at=date(2026, 8, 10),
         )
-        session.add(project)
-        await session.flush()
 
         rec = RecurringInvoice(
             client_id=client.id,
@@ -204,28 +202,27 @@ async def test_balance_and_advance_amounts():
     async with TestingSessionLocal() as session:
         client = (await session.execute(select(Client).limit(1))).scalars().first()
         assert client is not None
-        project = Project(
+        project = await make_project_with_client(
+            session,
             name="Balance Invoice Project",
             client_id=client.id,
             status="running",
             budget_paise=3000000,
-            advance_paise=1500000,
             development_days=15,
         )
-        session.add(project)
-        await session.flush()
+        advance_paise = 1500000
 
         adv = await create_project_amount_invoice(
             session,
             client_id=client.id,
             project_id=project.id,
-            amount_paise=project.advance_paise,
+            amount_paise=advance_paise,
             description="Advance",
             notes="Advance",
         )
         project.advance_invoice_id = adv.id
 
-        balance = max(project.budget_paise - project.advance_paise, 0)
+        balance = max(int(project.budget_paise or 0) - advance_paise, 0)
         assert balance == 1500000
         bal = await create_project_amount_invoice(
             session,

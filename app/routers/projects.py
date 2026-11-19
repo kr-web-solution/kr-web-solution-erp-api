@@ -80,10 +80,33 @@ def sanitize_project_for_role(
     *,
     invoiced_paise: Optional[int] = None,
 ) -> ProjectResponse:
-    resp = ProjectResponse.model_validate(project)
+    # Build from scalar fields only — ORM `clients`/`workers` are not ProjectClientBrief/UserResponse
     linked = list(getattr(project, "clients", None) or [])
     if not linked and project.client:
         linked = [project.client]
+    resp = ProjectResponse.model_validate(
+        {
+            "id": project.id,
+            "name": project.name,
+            "client_id": project.client_id,
+            "description": project.description,
+            "start_date": project.start_date,
+            "end_date": project.end_date,
+            "budget_paise": project.budget_paise,
+            "development_days": getattr(project, "development_days", None),
+            "advance_invoice_id": getattr(project, "advance_invoice_id", None),
+            "balance_invoice_id": getattr(project, "balance_invoice_id", None),
+            "go_live_at": getattr(project, "go_live_at", None),
+            "status": project.status,
+            "delivery_phase": getattr(project, "delivery_phase", None) or 5,
+            "engagement_id": getattr(project, "engagement_id", None),
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+            "clients": [],
+            "client_ids": [],
+            "workers": [],
+        }
+    )
     resp.clients = [
         ProjectClientBrief(
             id=c.id,
