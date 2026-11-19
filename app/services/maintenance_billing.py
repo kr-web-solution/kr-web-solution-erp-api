@@ -220,8 +220,10 @@ async def upsert_project_maintenance(
         if not project.go_live_at and (rec.next_run_date is None or rec.next_run_date <= today):
             rec.next_run_date = hold_until
         return rec
+    # Release-1: prefer synced primary column (mirrors project_clients.is_primary)
+    billing_client_id = project.client_id
     rec = RecurringInvoice(
-        client_id=project.client_id,
+        client_id=billing_client_id,
         project_id=project.id,
         amount_paise=amount_paise,
         send_day=send_day,

@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any
+from typing import Optional
 import bcrypt
 import jwt
 from cryptography.fernet import Fernet

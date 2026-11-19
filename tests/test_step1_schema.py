@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.models import Client, Invoice, LateFeeAction, Project, ProjectClient, RecurringInvoice
+from app.models import Client, Invoice, LateFeeAction, RecurringInvoice
 from tests.conftest import TestingSessionLocal, make_project_with_client
 
 

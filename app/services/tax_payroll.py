@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Tuple
+
+_PAISE = Decimal("1")
+
+
+def _percent_of_paise(base_paise: int, percent: Any) -> int:
+    """ROUND_HALF_UP to whole paise (one rounding rule for tax and statutory)."""
+    amount = Decimal(int(base_paise or 0)) * (Decimal(str(percent or 0)) / Decimal("100"))
+    return int(amount.quantize(_PAISE, rounding=ROUND_HALF_UP))
 
 
 def gst_is_enabled(settings: Any) -> bool:
@@ -19,7 +28,7 @@ def effective_tax_rate(settings: Any, requested: float | None = None) -> float:
 
 
 def compute_tax_paise(subtotal_paise: int, tax_rate_percent: float) -> int:
-    return int(round(int(subtotal_paise or 0) * (float(tax_rate_percent or 0) / 100.0)))
+    return _percent_of_paise(subtotal_paise, tax_rate_percent)
 
 
 def statutory_deductions_paise(settings: Any, gross_paise: int) -> Tuple[int, Dict[str, int]]:
@@ -32,16 +41,16 @@ def statutory_deductions_paise(settings: Any, gross_paise: int) -> Tuple[int, Di
     total = 0
 
     if getattr(settings, "pf_enabled", False):
-        pct = float(getattr(settings, "pf_employee_percent", 0) or 0)
-        if pct > 0:
-            amt = int(round(gross * (pct / 100.0)))
+        pct = getattr(settings, "pf_employee_percent", 0) or 0
+        if Decimal(str(pct)) > 0:
+            amt = _percent_of_paise(gross, pct)
             breakdown["pf"] = amt
             total += amt
 
     if getattr(settings, "esi_enabled", False):
-        pct = float(getattr(settings, "esi_employee_percent", 0) or 0)
-        if pct > 0:
-            amt = int(round(gross * (pct / 100.0)))
+        pct = getattr(settings, "esi_employee_percent", 0) or 0
+        if Decimal(str(pct)) > 0:
+            amt = _percent_of_paise(gross, pct)
             breakdown["esi"] = amt
             total += amt
 

@@ -45,6 +45,8 @@ def bucket_for(invoice_type: str, notes: str = "", description: str = "") -> str
 
 
 def _active(inv) -> bool:
+    if getattr(inv, "deleted_at", None) is not None:
+        return False
     return (getattr(inv, "status", "") or "") not in EXCLUDED
 
 

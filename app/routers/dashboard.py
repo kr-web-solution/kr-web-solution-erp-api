@@ -2,11 +2,11 @@ from datetime import date, datetime, timezone
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-from ..core.dependencies import get_db, get_current_user
+from ..core.dependencies import get_db, get_current_user, is_privileged
 from ..core.database import not_deleted
 from ..models import Project, Lead, Invoice, User, LateFeeAction, Client
 from ..schemas import (
@@ -19,6 +19,9 @@ from ..services.project_visibility import projects_visible_to_client
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 KOLKATA_TZ = ZoneInfo("Asia/Kolkata")
+# Revenue / AR must ignore soft-deleted rows and voided numbers (F-043).
+_EXCLUDED_INVOICE_STATUSES = ("draft", "cancelled", "void")
+_LIVE_UNPAID_STATUSES = ("sent", "overdue")
 
 
 def _last_six_month_keys(today: date) -> List[tuple[str, str, date, date]]:
@@ -57,7 +60,8 @@ async def _revenue_by_month(
     collected_map = {key: 0 for _, key, _, _ in window}
 
     billed_stmt = select(Invoice.issue_date, Invoice.total_paise).where(
-        Invoice.status != "draft",
+        not_deleted(Invoice),
+        Invoice.status.notin_(_EXCLUDED_INVOICE_STATUSES),
         Invoice.issue_date >= range_start,
         Invoice.issue_date < range_end,
     )
@@ -71,6 +75,7 @@ async def _revenue_by_month(
             billed_map[key] += int(total or 0)
 
     paid_stmt = select(Invoice.paid_at, Invoice.issue_date, Invoice.total_paise).where(
+        not_deleted(Invoice),
         Invoice.status == "paid",
     )
     if client_id:
@@ -113,7 +118,11 @@ async def get_dashboard_summary(
             select(func.count())
             .select_from(Project)
             .join(Project.workers)
-            .where(User.id == current_user.id, Project.status == "running")
+            .where(
+                User.id == current_user.id,
+                Project.status == "running",
+                not_deleted(Project),
+            )
         )
         running_projects_count = (await db.scalar(running_projects_stmt)) or 0
         open_leads_count = 0
@@ -128,7 +137,7 @@ async def get_dashboard_summary(
         rec_prj_stmt = (
             select(Project)
             .join(Project.workers)
-            .where(User.id == current_user.id)
+            .where(User.id == current_user.id, not_deleted(Project))
             .order_by(Project.updated_at.desc())
             .limit(5)
         )
@@ -161,28 +170,35 @@ async def get_dashboard_summary(
         failed_email_invoices_count = 0
         needs_action_invoices = []
 
-        # Unpaid invoices for client (sent + overdue)
+        # Unpaid invoices for client (sent + overdue); exclude soft-deleted / void
         unpaid_inv_stmt = (
             select(func.coalesce(func.sum(Invoice.total_paise), 0))
-            .where(Invoice.client_id == client_id, Invoice.status.in_(["sent", "overdue"]))
+            .where(
+                not_deleted(Invoice),
+                Invoice.client_id == client_id,
+                Invoice.status.in_(_LIVE_UNPAID_STATUSES),
+            )
         )
         unpaid_invoices_total_paise = (await db.scalar(unpaid_inv_stmt)) or 0
 
-        # Overdue invoices: status == 'overdue' OR (status == 'sent' AND due_date < today)
         overdue_stmt = (
             select(func.count())
             .select_from(Invoice)
             .where(
+                not_deleted(Invoice),
                 Invoice.client_id == client_id,
                 ((Invoice.status == "overdue") | ((Invoice.status == "sent") & (Invoice.due_date < today)))
             )
         )
         overdue_invoices_count = (await db.scalar(overdue_stmt)) or 0
 
-        # Recent invoices + projects for client
         rec_inv_stmt = (
             select(Invoice)
-            .where(Invoice.client_id == client_id, Invoice.status != "draft")
+            .where(
+                not_deleted(Invoice),
+                Invoice.client_id == client_id,
+                Invoice.status.notin_(_EXCLUDED_INVOICE_STATUSES),
+            )
             .order_by(Invoice.created_at.desc())
             .limit(5)
         )
@@ -200,25 +216,31 @@ async def get_dashboard_summary(
         ]
         revenue_by_month = await _revenue_by_month(db, today, client_id=client_id)
 
+    elif not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
     else:
         # Admin / Founder CEO: Complete business overview
         running_projects_stmt = (
             select(func.count())
             .select_from(Project)
-            .where(Project.status == "running")
+            .where(Project.status == "running", not_deleted(Project))
         )
         running_projects_count = (await db.scalar(running_projects_stmt)) or 0
 
         open_leads_stmt = (
             select(func.count())
             .select_from(Lead)
-            .where(Lead.status.in_(["new", "contacted", "proposal"]))
+            .where(Lead.status.in_(["new", "contacted", "proposal"]), not_deleted(Lead))
         )
         open_leads_count = (await db.scalar(open_leads_stmt)) or 0
 
         unpaid_inv_stmt = (
             select(func.coalesce(func.sum(Invoice.total_paise), 0))
-            .where(Invoice.status.in_(["sent", "overdue"]))
+            .where(
+                not_deleted(Invoice),
+                Invoice.status.in_(_LIVE_UNPAID_STATUSES),
+            )
         )
         unpaid_invoices_total_paise = (await db.scalar(unpaid_inv_stmt)) or 0
 
@@ -226,6 +248,7 @@ async def get_dashboard_summary(
             select(func.count())
             .select_from(Invoice)
             .where(
+                not_deleted(Invoice),
                 (Invoice.status == "overdue") |
                 ((Invoice.status == "sent") & (Invoice.due_date < today))
             )
@@ -235,7 +258,7 @@ async def get_dashboard_summary(
         failed_email_stmt = (
             select(func.count())
             .select_from(Invoice)
-            .where(Invoice.email_status == "failed")
+            .where(not_deleted(Invoice), Invoice.email_status == "failed")
         )
         failed_email_invoices_count = (await db.scalar(failed_email_stmt)) or 0
 
@@ -243,7 +266,11 @@ async def get_dashboard_summary(
             select(LateFeeAction, Invoice.invoice_number, Client.name.label("client_name"))
             .join(Invoice, LateFeeAction.invoice_id == Invoice.id)
             .join(Client, Invoice.client_id == Client.id)
-            .where(LateFeeAction.status == "pending")
+            .where(
+                LateFeeAction.status == "pending",
+                not_deleted(Invoice),
+                not_deleted(Client),
+            )
             .order_by(LateFeeAction.created_at.desc())
         )
         res = (await db.execute(needs_act_stmt)).all()
@@ -270,10 +297,30 @@ async def get_dashboard_summary(
             for action, inv_num, cli_name in res
         ]
 
-        # Gather recent 5 items across projects, leads, and invoices
-        rec_prj = (await db.execute(select(Project).order_by(Project.created_at.desc()).limit(3))).scalars().all()
-        rec_lead = (await db.execute(select(Lead).order_by(Lead.created_at.desc()).limit(3))).scalars().all()
-        rec_inv = (await db.execute(select(Invoice).order_by(Invoice.created_at.desc()).limit(3))).scalars().all()
+        rec_prj = (
+            await db.execute(
+                select(Project)
+                .where(not_deleted(Project))
+                .order_by(Project.created_at.desc())
+                .limit(3)
+            )
+        ).scalars().all()
+        rec_lead = (
+            await db.execute(
+                select(Lead).where(not_deleted(Lead)).order_by(Lead.created_at.desc()).limit(3)
+            )
+        ).scalars().all()
+        rec_inv = (
+            await db.execute(
+                select(Invoice)
+                .where(
+                    not_deleted(Invoice),
+                    Invoice.status.notin_(_EXCLUDED_INVOICE_STATUSES),
+                )
+                .order_by(Invoice.created_at.desc())
+                .limit(3)
+            )
+        ).scalars().all()
 
         all_recent = []
         for p in rec_prj:

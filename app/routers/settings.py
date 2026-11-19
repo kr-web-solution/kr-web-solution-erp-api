@@ -1,7 +1,7 @@
 from typing import List, Optional
 from pathlib import Path
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo
 from ..core.security import encrypt_secret
 from ..models import Settings, EmailTemplate, User
+from ..services.audit import snapshot_entity, write_audit
 from ..schemas import (
     SettingsResponse, SettingsUpdate, SMTPSettingsUpdate,
     TestEmailRequest, EmailTemplateResponse, EmailTemplateUpdate
@@ -104,8 +105,9 @@ async def get_settings(
 @router.put("", response_model=SettingsResponse)
 async def update_settings(
     payload: SettingsUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
     res = await db.execute(select(Settings).where(Settings.id == "default"))
     st = res.scalars().first()
@@ -113,6 +115,7 @@ async def update_settings(
         st = Settings(id="default")
         db.add(st)
 
+    before = snapshot_entity(st)
     data = payload.model_dump(exclude_unset=True)
     if "invoice_prefix" in data and data["invoice_prefix"] is not None:
         raw = str(data["invoice_prefix"]).strip().upper()
@@ -126,6 +129,16 @@ async def update_settings(
     elif any(getattr(st, k) for k in BANK_FIELD_KEYS):
         st.bank_upi_details = compose_bank_upi_details(st)
 
+    await write_audit(
+        db,
+        current_user,
+        "settings",
+        st.id,
+        "update",
+        before=before,
+        after=snapshot_entity(st),
+        request=request,
+    )
     await db.commit()
     await db.refresh(st)
 
@@ -140,8 +153,9 @@ async def update_settings(
 @router.put("/smtp", response_model=SettingsResponse)
 async def update_smtp_settings(
     payload: SMTPSettingsUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
     res = await db.execute(select(Settings).where(Settings.id == "default"))
     st = res.scalars().first()
@@ -149,6 +163,7 @@ async def update_smtp_settings(
         st = Settings(id="default")
         db.add(st)
 
+    before = snapshot_entity(st, ["smtp_host", "smtp_port", "smtp_username", "smtp_from_email", "smtp_use_tls"])
     update_data = payload.model_dump(exclude_unset=True)
     if "smtp_password" in update_data:
         pwd = update_data.pop("smtp_password")
@@ -158,6 +173,20 @@ async def update_smtp_settings(
     for k, v in update_data.items():
         setattr(st, k, v)
 
+    await write_audit(
+        db,
+        current_user,
+        "settings",
+        st.id,
+        "update",
+        before=before,
+        after={
+            **snapshot_entity(st, ["smtp_host", "smtp_port", "smtp_username", "smtp_from_email", "smtp_use_tls"]),
+            "smtp_password_changed": "smtp_password" in payload.model_dump(exclude_unset=True)
+            and bool(payload.model_dump(exclude_unset=True).get("smtp_password")),
+        },
+        request=request,
+    )
     await db.commit()
     await db.refresh(st)
 

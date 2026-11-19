@@ -5,14 +5,16 @@ from __future__ import annotations
 import os
 
 # --- Hard safety gate (must run before importing app / opening any DB) ---
-# Tests ignore .env DATABASE_URL entirely. Only TEST_DATABASE_URL (or the local
-# default below) is used. A polluted shell TEST_DATABASE_URL pointing at a
+# Tests ignore .env DATABASE_URL entirely. TEST_DATABASE_URL is required
+# (no password defaults in code). A polluted TEST_DATABASE_URL pointing at a
 # non-test DB name is aborted by assert_safe_test_database.
-_DEFAULT_TEST_URL = (
-    "postgresql+asyncpg://postgres:udhaya@localhost:5432/kr-web-solution-erp-test"
-)
-# Do not read DATABASE_URL from the environment/.env for tests.
-TEST_DB_URL = (os.environ.get("TEST_DATABASE_URL") or _DEFAULT_TEST_URL).strip()
+TEST_DB_URL = (os.environ.get("TEST_DATABASE_URL") or "").strip()
+if not TEST_DB_URL:
+    raise SystemExit(
+        "TEST SAFETY ABORT: set TEST_DATABASE_URL to a dedicated local test database "
+        "(name must contain 'test' or 'pytest'). Example: "
+        "postgresql+asyncpg://USER:PASSWORD@localhost:5432/kr-web-solution-erp-test"
+    )
 
 # Force local/test env so Settings validators and the guard stay consistent.
 os.environ["ENVIRONMENT"] = "test"

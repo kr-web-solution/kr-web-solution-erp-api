@@ -2,7 +2,7 @@
 
 from fastapi.testclient import TestClient
 
-from tests.conftest import TEST_USERS, get_auth_cookies
+from tests.conftest import TEST_USERS
 
 
 def test_health(client: TestClient):

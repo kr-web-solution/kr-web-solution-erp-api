@@ -53,6 +53,24 @@ tmp/
 temp/
 *.log
 
+# Ops / incident / dumps (live under ../krweb-ops-private — never commit)
+scripts/_incident_*
+scripts/_propose_incident_*
+scripts/_mig_rehearsal_*
+scripts/_local_test_dump*
+scripts/_cleanup_*
+scripts/_audit_*
+scripts/_scan_*
+scripts/_scrub_*
+scripts/_list_tables.py
+scripts/_write_dump_counts.py
+scripts/_make_local_test_dump*
+import_templates/
+alembic/versions/*.pending
+**/client_secret*.json
+*.dump
+*.dump.counts.json
+
 # Local databases (if used for smoke tests)
 *.db
 *.sqlite

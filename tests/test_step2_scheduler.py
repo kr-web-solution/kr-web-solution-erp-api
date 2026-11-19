@@ -12,7 +12,7 @@ from app.services.scheduler import (
     step_b_dispatch_due_reminders,
     step_c_check_and_mark_overdue,
 )
-from tests.conftest import TEST_USERS, get_auth_cookies, make_project_with_client
+from tests.conftest import make_project_with_client
 
 
 @pytest.mark.asyncio

@@ -3,12 +3,11 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..common.workflow import (
-    DELIVERY_STAGES,
     MAX_STAGE,
     MIN_STAGE,
     PIPELINE_STAGES,
@@ -303,7 +302,6 @@ async def _ensure_project_internal(
             )
 
     resolved_budget = int(budget_paise) if budget_paise is not None else 0
-    resolved_advance = int(advance_paise) if advance_paise is not None else 0
     resolved_days = development_days
 
     if eng.project_id:

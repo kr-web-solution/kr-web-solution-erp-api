@@ -41,6 +41,37 @@ def upgrade() -> None:
         ondelete="RESTRICT",
     )
 
+    # --- Abort ambiguous backfill (F-050) before DISTINCT ON can pick the wrong project ---
+    # Already-applied environments never re-run this upgrade. Fresh upgrades must not
+    # silently assign the lowest project_id when a client has multiple live projects.
+    bind = op.get_bind()
+    ambiguous = bind.execute(
+        sa.text(
+            """
+            SELECT c.id AS client_id, COUNT(DISTINCT p.id) AS project_count
+            FROM clients c
+            JOIN projects p ON p.client_id = c.id AND p.deleted_at IS NULL
+            WHERE EXISTS (
+                SELECT 1 FROM invoices i
+                WHERE i.client_id = c.id AND i.project_id IS NULL
+            )
+            OR EXISTS (
+                SELECT 1 FROM recurring_invoices r
+                WHERE r.client_id = c.id AND r.project_id IS NULL
+            )
+            GROUP BY c.id
+            HAVING COUNT(DISTINCT p.id) > 1
+            """
+        )
+    ).fetchall()
+    if ambiguous:
+        sample = ", ".join(f"{r[0]}({r[1]} projects)" for r in ambiguous[:10])
+        raise RuntimeError(
+            "Migration 021 aborted (F-050): cannot auto-backfill project_id when a client "
+            "has multiple live projects and NULL project_id on invoices/recurring_invoices. "
+            f"Resolve manually first. Ambiguous clients: {sample}"
+        )
+
     # --- Backfill invoices.project_id ---
     op.execute(
         sa.text(

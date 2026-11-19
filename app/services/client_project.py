@@ -80,12 +80,51 @@ async def assert_client_on_project(
 
 
 def project_has_client(project: Project, client_id: Optional[str]) -> bool:
+    """Membership check via project_clients (loaded `clients`) — not the legacy column alone."""
     if not client_id:
         return False
-    if project.client_id == client_id:
-        return True
     clients = getattr(project, "clients", None) or []
-    return any(c.id == client_id for c in clients)
+    if any(c.id == client_id for c in clients):
+        return True
+    # Fallback only when M2M not loaded
+    return project.client_id == client_id
+
+
+def primary_client_id_from_project(project: Project) -> Optional[str]:
+    """Release-1 read path: prefer project_clients.is_primary; sync column is fallback.
+
+    When `project.clients` is loaded as Client objects without is_primary, callers
+    should pass membership rows via ``primary_client_id_from_links``.
+    """
+    return getattr(project, "client_id", None)
+
+
+async def resolve_primary_client_id(db: AsyncSession, project_id: str) -> Optional[str]:
+    """Authoritative primary from project_clients (release-1; column kept in sync)."""
+    row = (
+        await db.execute(
+            select(ProjectClient).where(
+                ProjectClient.project_id == project_id,
+                ProjectClient.is_primary.is_(True),
+            )
+        )
+    ).scalars().first()
+    if row:
+        return row.client_id
+    any_row = (
+        await db.execute(
+            select(ProjectClient).where(ProjectClient.project_id == project_id)
+        )
+    ).scalars().first()
+    return any_row.client_id if any_row else None
+
+
+async def sync_project_client_id_column(db: AsyncSession, project: Project) -> None:
+    """Keep projects.client_id mirrored from primary project_clients row (until drop)."""
+    primary = await resolve_primary_client_id(db, project.id)
+    if primary and project.client_id != primary:
+        project.client_id = primary
+        await db.flush()
 
 
 # ---------------------------------------------------------------------------

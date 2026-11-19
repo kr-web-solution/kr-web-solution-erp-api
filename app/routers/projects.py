@@ -1,6 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func  # noqa: F401 — delete used in update_project
@@ -11,11 +11,9 @@ from ..core.database import not_deleted
 from ..common.workflow import DELIVERY_MAX_STAGE, DELIVERY_MIN_STAGE, WARRANTY_DEFAULT_DAYS
 from ..models import (
     Project,
-    Client,
     User,
     ProjectWorker,
     RecurringInvoice,
-    ProjectChecklistItem,
     ProjectFeature,
     ProjectFeatureDoc,
     ProjectDocument,
@@ -40,6 +38,7 @@ from ..schemas import (
     ProjectFeatureDocResponse,
     ProjectDocumentResponse,
 )
+from ..services.audit import snapshot_entity, write_audit
 from ..services.client_project import (
     add_client_to_project,
     create_project as create_project_record,
@@ -48,7 +47,7 @@ from ..services.client_project import (
     remove_client_from_project,
     set_project_clients,
 )
-from ..services.project_visibility import projects_visible_to_client
+from ..services.project_visibility import client_is_on_project, projects_visible_to_client
 from ..models import Invoice
 from ..services.project_delivery import (
     checklist_progress,
@@ -107,17 +106,28 @@ def sanitize_project_for_role(
             "workers": [],
         }
     )
+    # Release-1: API still exposes client_id, but is_primary comes from M2M when present.
+    primary_id = project.client_id
+    for c in linked:
+        # Client ORM objects may carry transient _is_primary from loader
+        if getattr(c, "_is_primary", None) is True:
+            primary_id = c.id
+            break
     resp.clients = [
         ProjectClientBrief(
             id=c.id,
             name=c.name,
-            is_primary=(c.id == project.client_id),
+            is_primary=(c.id == primary_id),
         )
         for c in linked
     ]
-    resp.client_ids = [c.id for c in linked] or ([project.client_id] if project.client_id else [])
-    resp.client_name = project.client.name if project.client else (
-        linked[0].name if linked else None
+    resp.client_id = primary_id
+    resp.client_ids = [c.id for c in linked] or ([primary_id] if primary_id else [])
+    primary_client = next((c for c in linked if c.id == primary_id), None)
+    resp.client_name = (
+        primary_client.name if primary_client else (
+            project.client.name if project.client else (linked[0].name if linked else None)
+        )
     )
     resp.workers = [UserResponse.model_validate(w) for w in project.workers]
     resp.delivery_phase = getattr(project, "delivery_phase", None) or 5
@@ -157,7 +167,7 @@ def sanitize_project_for_role(
 
 
 async def _project_invoiced_map(db: AsyncSession, project_ids: List[str]) -> dict:
-    """Sum ex-GST project-invoice subtots per project (all statuses)."""
+    """Sum ex-GST development subtots; exclude soft-deleted and cancelled/void (F-043)."""
     if not project_ids:
         return {}
     rows = (
@@ -166,6 +176,7 @@ async def _project_invoiced_map(db: AsyncSession, project_ids: List[str]) -> dic
             .where(
                 Invoice.project_id.in_(project_ids),
                 Invoice.ledger == "development",
+                not_deleted(Invoice),
                 Invoice.status.notin_(["cancelled", "void"]),
             )
             .group_by(Invoice.project_id)
@@ -202,7 +213,9 @@ async def _load_project(db: AsyncSession, project_id: str, *extra_opts) -> Proje
     return project
 
 
-async def _assert_project_access(project: Project, user: User, *, write: bool = False) -> None:
+async def _assert_project_access(
+    project: Project, user: User, *, db: AsyncSession, write: bool = False
+) -> None:
     if is_privileged(user.role):
         return
     if user.role == "worker":
@@ -210,7 +223,7 @@ async def _assert_project_access(project: Project, user: User, *, write: bool = 
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
         return
     if user.role == "client":
-        if write or not project_has_client(project, user.client_id):
+        if write or not await client_is_on_project(db, project.id, user.client_id):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
         return
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
@@ -241,6 +254,8 @@ async def list_projects(
         if not current_user.client_id:
             return []
         stmt = stmt.where(projects_visible_to_client(current_user.client_id))
+    elif not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     if status_filter and status_filter != "all":
         stmt = stmt.where(Project.status == status_filter)
@@ -265,9 +280,14 @@ async def project_money(
     from ..services.project_money import summarize_invoices
 
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     invoices = (
-        await db.execute(select(Invoice).where(Invoice.project_id == project.id))
+        await db.execute(
+            select(Invoice).where(
+                Invoice.project_id == project.id,
+                not_deleted(Invoice),
+            )
+        )
     ).scalars().all()
     summary = summarize_invoices(project, invoices)
     if current_user.role == "worker":
@@ -282,7 +302,7 @@ async def get_project(
     current_user: User = Depends(get_current_user)
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     return await _sanitize_project(db, project, current_user.role)
 
 
@@ -290,10 +310,20 @@ async def get_project(
 async def link_project_client(
     project_id: str,
     payload: ProjectClientAdd,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo),
+    current_user: User = Depends(require_founder_ceo),
 ):
     await add_client_to_project(db, project_id, payload.client_id)
+    await write_audit(
+        db,
+        current_user,
+        "project_clients",
+        project_id,
+        "membership_add",
+        after={"client_id": payload.client_id, "project_id": project_id},
+        request=request,
+    )
     await db.commit()
     project = await _load_project(db, project_id)
     return sanitize_project_for_role(project, "founder_ceo")
@@ -303,10 +333,20 @@ async def link_project_client(
 async def unlink_project_client(
     project_id: str,
     client_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo),
+    current_user: User = Depends(require_founder_ceo),
 ):
     await remove_client_from_project(db, project_id, client_id)
+    await write_audit(
+        db,
+        current_user,
+        "project_clients",
+        project_id,
+        "membership_remove",
+        before={"client_id": client_id, "project_id": project_id},
+        request=request,
+    )
     await db.commit()
     project = await _load_project(db, project_id)
     return sanitize_project_for_role(project, "founder_ceo")
@@ -314,8 +354,9 @@ async def unlink_project_client(
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 async def create_project(
     payload: ProjectCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
     project = await create_project_record(
         db,
@@ -328,7 +369,9 @@ async def create_project(
         status="lead",
         delivery_phase=5,
     )
-    primary_id = project.client_id
+    from ..services.client_project import resolve_primary_client_id
+
+    primary_id = await resolve_primary_client_id(db, project.id) or project.client_id
     await ensure_project_checklist(db, project, done_through_stage=0)
 
     if payload.worker_ids:
@@ -363,6 +406,15 @@ async def create_project(
         )
         db.add(rec)
 
+    await write_audit(
+        db,
+        current_user,
+        "projects",
+        project.id,
+        "create",
+        after=snapshot_entity(project, ["name", "status", "client_id", "budget_paise"]),
+        request=request,
+    )
     await db.commit()
 
     created_prj = await _load_project(db, project.id)
@@ -401,7 +453,7 @@ async def list_project_documents(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     rows = (
         await db.execute(
             select(ProjectDocument)
@@ -453,7 +505,7 @@ async def download_project_document(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     doc = (
         await db.execute(
             select(ProjectDocument).where(
@@ -707,10 +759,12 @@ async def create_project_balance_invoice(
 async def update_project(
     project_id: str,
     payload: ProjectUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     project = await _load_project(db, project_id)
+    before = snapshot_entity(project, ["name", "status", "client_id", "budget_paise", "description"])
 
     if current_user.role == "worker":
         worker_ids = [w.id for w in project.workers]
@@ -719,12 +773,24 @@ async def update_project(
 
         if payload.status:
             project.status = payload.status
+        await write_audit(
+            db,
+            current_user,
+            "projects",
+            project.id,
+            "update",
+            before=before,
+            after=snapshot_entity(project, ["name", "status", "client_id", "budget_paise", "description"]),
+            request=request,
+        )
         await db.commit()
         project = await _load_project(db, project_id)
         return sanitize_project_for_role(project, current_user.role)
 
     elif current_user.role == "client":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Clients cannot edit projects")
+    elif not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     update_data = payload.model_dump(exclude_unset=True)
     worker_ids = update_data.pop("worker_ids", None)
@@ -770,6 +836,16 @@ async def update_project(
     if maintenance_amount is not None:
         await upsert_project_maintenance(db, project, maintenance_amount)
 
+    await write_audit(
+        db,
+        current_user,
+        "projects",
+        project.id,
+        "update",
+        before=before,
+        after=snapshot_entity(project, ["name", "status", "client_id", "budget_paise", "description"]),
+        request=request,
+    )
     await db.commit()
 
     refreshed = await _load_project(db, project.id)
@@ -778,10 +854,20 @@ async def update_project(
 @router.delete("/{project_id}", status_code=status.HTTP_200_OK)
 async def delete_project(
     project_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
     await delete_project_record(db, project_id)
+    await write_audit(
+        db,
+        current_user,
+        "projects",
+        project_id,
+        "soft_delete",
+        after={"deleted": True},
+        request=request,
+    )
     await db.commit()
     return {"message": "Project deleted successfully"}
 
@@ -795,7 +881,7 @@ async def get_project_delivery(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     await ensure_project_checklist(db, project, done_through_stage=0)
     await db.commit()
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
@@ -824,7 +910,7 @@ async def toggle_project_checklist(
     if current_user.role == "client":
         raise HTTPException(status_code=403, detail="Clients cannot update delivery checklist")
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     item = next((i for i in project.checklist_items if i.id == item_id), None)
     if not item:
         raise HTTPException(status_code=404, detail="Checklist item not found")
@@ -846,7 +932,7 @@ async def advance_project_delivery(
     if current_user.role == "client":
         raise HTTPException(status_code=403, detail="Forbidden")
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
 
     phase = project.delivery_phase or DELIVERY_MIN_STAGE
     stage_items = [i for i in (project.checklist_items or []) if i.stage_number == phase]
@@ -918,7 +1004,7 @@ async def list_project_features(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     stmt = (
         select(ProjectFeature)
         .options(selectinload(ProjectFeature.docs))
@@ -966,7 +1052,7 @@ async def update_project_feature(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     if current_user.role == "client":
         raise HTTPException(status_code=403, detail="Forbidden")
 

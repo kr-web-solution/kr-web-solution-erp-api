@@ -66,8 +66,12 @@ class Settings(BaseSettings):
     BILLING_MAIL_NAME: Optional[str] = "KR Web Solution – Billing Team"
     BILLING_FROM_MAIL: Optional[str] = "billing@krwebsolution.com"
 
-    # Database: Pure PostgreSQL
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:udhaya@localhost:5432/kr-web-solution-erp"
+    # Database: Pure PostgreSQL — set via env / .env (no password literal in code)
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:CHANGE_ME@localhost:5432/kr-web-solution-erp"
+
+    # Background scheduler: default off unless ENVIRONMENT=production.
+    # Set ENABLE_SCHEDULER=true/false to override. Never starts in tests.
+    ENABLE_SCHEDULER: Optional[bool] = None
 
     # CORS & Web
     BACKEND_CORS_ORIGINS: List[str] = [

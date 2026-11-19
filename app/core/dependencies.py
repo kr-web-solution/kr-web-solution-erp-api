@@ -1,5 +1,5 @@
 from collections.abc import AsyncGenerator
-from typing import Optional, List, Callable
+from typing import Optional, Callable
 from fastapi import Request, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession

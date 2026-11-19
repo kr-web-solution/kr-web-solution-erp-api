@@ -33,6 +33,7 @@ from ..schemas import (
     ForgotPasswordRequest,
     ResetPasswordRequest,
 )
+from ..services.audit import write_audit
 from ..services.email import send_email_async
 from ..services.email_policy import assert_oauth_email_allowed
 from ..services.microsoft_oauth import verify_microsoft_id_token, email_from_microsoft_claims
@@ -101,6 +102,7 @@ async def oauth_providers():
 async def login(
     credentials: LoginRequest,
     response: Response,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     user = await _get_active_user_by_email(db, credentials.email)
@@ -108,6 +110,16 @@ async def login(
     if not user or not password_is_set(user) or not verify_password(
         credentials.password, user.password_hash
     ):
+        await write_audit(
+            db,
+            None,
+            "auth",
+            user.id if user else "unknown",
+            "login_failure",
+            after={"email": (credentials.email or "")[:120], "reason": "bad_credentials"},
+            request=request,
+        )
+        await db.commit()
         if user and not password_is_set(user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -119,11 +131,30 @@ async def login(
         )
 
     if not user.is_active:
+        await write_audit(
+            db,
+            user,
+            "auth",
+            user.id,
+            "login_failure",
+            after={"email": user.email, "reason": "inactive"},
+            request=request,
+        )
+        await db.commit()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User account is inactive",
         )
 
+    await write_audit(
+        db,
+        user,
+        "auth",
+        user.id,
+        "login_success",
+        after={"email": user.email},
+        request=request,
+    )
     return await _login_response_for(user, response, db)
 
 

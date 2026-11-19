@@ -96,7 +96,7 @@ Create `kr-erp-api/.env` (modeled after `.env.example`):
 
 ```env
 # Database (PostgreSQL with asyncpg driver)
-DATABASE_URL=postgresql+asyncpg://postgres:udhaya@localhost:5432/kr-web-solution-erp
+DATABASE_URL=postgresql+asyncpg://postgres:CHANGE_ME@localhost:5432/kr-web-solution-erp
 
 # Application & Environment
 PROJECT_NAME="KR Workspace CRM + ERP API"

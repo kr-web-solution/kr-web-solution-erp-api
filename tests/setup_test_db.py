@@ -9,15 +9,15 @@ from urllib.parse import urlparse
 
 import asyncpg
 
-from tests.db_safety import assert_safe_test_database, database_name_from_url
-
-DEFAULT_TEST_URL = (
-    "postgresql+asyncpg://postgres:udhaya@localhost:5432/kr-web-solution-erp-test"
-)
-
+from tests.db_safety import assert_safe_test_database
 
 async def reset_test_database() -> None:
-    test_url = os.environ.get("TEST_DATABASE_URL", DEFAULT_TEST_URL).strip()
+    test_url = (os.environ.get("TEST_DATABASE_URL") or "").strip()
+    if not test_url:
+        raise SystemExit(
+            "Set TEST_DATABASE_URL to a dedicated local test database "
+            "(name must contain 'test' or 'pytest'). No password default is baked into this script."
+        )
     os.environ["ENVIRONMENT"] = "test"
     os.environ["PRODUCTION"] = "false"
     db_name = assert_safe_test_database(

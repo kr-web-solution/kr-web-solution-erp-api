@@ -1,10 +1,9 @@
-from typing import List, Optional
+from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from sqlalchemy.orm import selectinload
 
-from ..core.dependencies import get_db, get_current_user, require_founder_ceo
+from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
 from ..core.database import not_deleted
 from ..models import Client, Project, ProjectClient, Invoice, User
 from ..schemas import ClientResponse, ClientCreate, ClientUpdate
@@ -71,8 +70,10 @@ async def list_clients(
             .where(User.id == current_user.id, not_deleted(Client), not_deleted(Project))
             .distinct()
         )
+    elif not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     else:
-        # founder_ceo sees all
+        # founder_ceo / admin sees all
         stmt = select(Client).where(not_deleted(Client)).order_by(Client.name.asc())
 
     res = await db.execute(stmt)
@@ -98,7 +99,24 @@ async def get_client(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.role == "client" and current_user.client_id != client_id:
+    if current_user.role == "client":
+        if current_user.client_id != client_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    elif current_user.role == "worker":
+        assigned = await db.scalar(
+            select(ProjectClient.client_id)
+            .join(Project, Project.id == ProjectClient.project_id)
+            .join(Project.workers)
+            .where(
+                User.id == current_user.id,
+                ProjectClient.client_id == client_id,
+                not_deleted(Project),
+            )
+            .limit(1)
+        )
+        if assigned is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    elif not is_privileged(current_user.role):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     res = await db.execute(select(Client).where(Client.id == client_id, not_deleted(Client)))

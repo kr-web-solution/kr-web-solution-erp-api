@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core import lookups_catalog as cat
-from ..core.roles_catalog import ROLE_SEED, ROLE_ID_BY_CODE, party_type_for_role
+from ..core.roles_catalog import ROLE_SEED
 from ..models import Role
 from ..models_lookups import (
     PartyType,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from typing import Optional
 
 from botocore.exceptions import ClientError
 from fastapi import HTTPException

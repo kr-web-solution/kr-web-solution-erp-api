@@ -13,11 +13,9 @@ from app.core.exceptions import BusinessRuleError
 from app.models import Engagement, Invoice, ProjectClient
 from app.schemas import InvoiceUpdate
 from app.services.client_project import (
-    add_client_to_project,
     create_project,
     remove_client_from_project,
 )
-from tests.conftest import make_project_with_client
 from tests.test_client_project_rules import _make_client
 
 

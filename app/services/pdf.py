@@ -1,5 +1,4 @@
 import io
-from datetime import date
 from typing import Optional
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -35,45 +34,6 @@ def generate_invoice_pdf(
     styles = getSampleStyleSheet()
 
     # Custom styles
-    title_style = ParagraphStyle(
-        'InvoiceTitle',
-        parent=styles['Heading1'],
-        fontName='Helvetica-Bold',
-        fontSize=24,
-        leading=28,
-        textColor=colors.HexColor('#E32B2B'),
-        alignment=TA_RIGHT
-    )
-
-    company_title_style = ParagraphStyle(
-        'CompanyTitle',
-        parent=styles['Heading2'],
-        fontName='Helvetica-Bold',
-        fontSize=16,
-        leading=20,
-        textColor=colors.HexColor('#12141C'),
-    )
-
-    meta_label_style = ParagraphStyle(
-        'MetaLabel',
-        parent=styles['Normal'],
-        fontName='Helvetica-Bold',
-        fontSize=9,
-        leading=12,
-        textColor=colors.HexColor('#64748B'),
-        alignment=TA_RIGHT
-    )
-
-    meta_val_style = ParagraphStyle(
-        'MetaVal',
-        parent=styles['Normal'],
-        fontName='Helvetica',
-        fontSize=10,
-        leading=13,
-        textColor=colors.HexColor('#0F172A'),
-        alignment=TA_RIGHT
-    )
-
     body_style = ParagraphStyle(
         'NormalBody',
         parent=styles['Normal'],
