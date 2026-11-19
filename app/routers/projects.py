@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
 from ..core.database import not_deleted
+from ..services.project_visibility import projects_visible_to_client
 from ..common.workflow import DELIVERY_MAX_STAGE, DELIVERY_MIN_STAGE, WARRANTY_DEFAULT_DAYS
 from ..models import (
     Project,
@@ -183,10 +184,10 @@ async def list_projects(
         # Workers see only projects assigned to them
         stmt = stmt.join(Project.workers).where(User.id == current_user.id)
     elif current_user.role == "client":
-        # Clients see only their projects
+        # Clients see projects they are linked to (M2M via project_clients)
         if not current_user.client_id:
             return []
-        stmt = stmt.where(Project.client_id == current_user.client_id)
+        stmt = stmt.where(projects_visible_to_client(current_user.client_id))
 
     if status_filter and status_filter != "all":
         stmt = stmt.where(Project.status == status_filter)

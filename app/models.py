@@ -182,7 +182,11 @@ class Client(SoftDeleteMixin, TimestampMixin, Base):
 
     # Relationships
     users: Mapped[List["User"]] = relationship("User", back_populates="client")
-    projects: Mapped[List["Project"]] = relationship("Project", back_populates="client", cascade="all, delete-orphan")
+    projects: Mapped[List["Project"]] = relationship(
+        "Project",
+        secondary="project_clients",
+        back_populates="clients",
+    )
     invoices: Mapped[List["Invoice"]] = relationship("Invoice", back_populates="client", cascade="all, delete-orphan")
     recurring_invoices: Mapped[List["RecurringInvoice"]] = relationship("RecurringInvoice", back_populates="client", cascade="all, delete-orphan")
 
@@ -267,14 +271,30 @@ class Project(SoftDeleteMixin, TimestampMixin, Base):
     )
 
     # Relationships
-    client: Mapped["Client"] = relationship("Client", back_populates="projects")
+    # client_id = primary/billing client (always one of `clients`; required ≥1 via project_clients)
+    client: Mapped["Client"] = relationship("Client", foreign_keys=[client_id])
+    clients: Mapped[List["Client"]] = relationship(
+        "Client",
+        secondary="project_clients",
+        back_populates="projects",
+        lazy="selectin",
+    )
     workers: Mapped[List["User"]] = relationship("User", secondary="project_workers", back_populates="assigned_projects")
+    # No cascade delete-orphan: children must be removed explicitly before project delete.
     invoices: Mapped[List["Invoice"]] = relationship(
         "Invoice",
         back_populates="project",
         foreign_keys="Invoice.project_id",
     )
-    recurring_invoices: Mapped[List["RecurringInvoice"]] = relationship("RecurringInvoice", back_populates="project")
+    recurring_invoices: Mapped[List["RecurringInvoice"]] = relationship(
+        "RecurringInvoice",
+        back_populates="project",
+    )
+
+    @property
+    def maintenance_plans(self) -> List["RecurringInvoice"]:
+        """Domain alias: recurring maintenance plans for this project."""
+        return list(self.recurring_invoices or [])
     checklist_items: Mapped[List["ProjectChecklistItem"]] = relationship(
         "ProjectChecklistItem",
         back_populates="project",
@@ -292,6 +312,22 @@ class Project(SoftDeleteMixin, TimestampMixin, Base):
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="ProjectDocument.created_at.desc()",
+    )
+
+
+class ProjectClient(Base):
+    """Many-to-many: project ↔ clients. A project must keep ≥1 client."""
+
+    __tablename__ = "project_clients"
+
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    client_id: Mapped[str] = mapped_column(
+        ForeignKey("clients.id", ondelete="RESTRICT"), primary_key=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 
@@ -439,7 +475,9 @@ class Invoice(SoftDeleteMixin, TimestampMixin, Base):
     covers_to: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     monthly_rate_paise: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
-    project_id: Mapped[Optional[str]] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
     recurring_id: Mapped[Optional[str]] = mapped_column(ForeignKey("recurring_invoices.id", ondelete="SET NULL"), nullable=True, index=True)
     period_key: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)  # e.g. "2026-11"
     parent_invoice_id: Mapped[Optional[str]] = mapped_column(ForeignKey("invoices.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -473,7 +511,7 @@ class Invoice(SoftDeleteMixin, TimestampMixin, Base):
 
     # Relationships
     client: Mapped["Client"] = relationship("Client", back_populates="invoices")
-    project: Mapped[Optional["Project"]] = relationship(
+    project: Mapped["Project"] = relationship(
         "Project",
         back_populates="invoices",
         foreign_keys=[project_id],
@@ -531,7 +569,9 @@ class RecurringInvoice(SoftDeleteMixin, TimestampMixin, Base):
         index=True
     )
     client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
-    project_id: Mapped[Optional[str]] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
     amount_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     send_day: Mapped[int] = mapped_column(Integer, default=1, nullable=False)  # 1-28
     due_after_days: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
@@ -545,9 +585,9 @@ class RecurringInvoice(SoftDeleteMixin, TimestampMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # Relationships
+    # Relationships (MaintenancePlan == RecurringInvoice)
     client: Mapped["Client"] = relationship("Client", back_populates="recurring_invoices")
-    project: Mapped[Optional["Project"]] = relationship("Project", back_populates="recurring_invoices")
+    project: Mapped["Project"] = relationship("Project", back_populates="recurring_invoices")
 
 
 class LateFeeAction(SoftDeleteMixin, TimestampMixin, Base):

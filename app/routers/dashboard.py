@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from ..core.dependencies import get_db, get_current_user
+from ..core.database import not_deleted
 from ..models import Project, Lead, Invoice, User, LateFeeAction, Client
 from ..schemas import (
     DashboardResponse,
@@ -14,6 +15,7 @@ from ..schemas import (
     LateFeeActionResponse,
     RevenueMonthPoint,
 )
+from ..services.project_visibility import projects_visible_to_client
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 KOLKATA_TZ = ZoneInfo("Asia/Kolkata")
@@ -148,7 +150,11 @@ async def get_dashboard_summary(
         running_projects_stmt = (
             select(func.count())
             .select_from(Project)
-            .where(Project.client_id == client_id, Project.status == "running")
+            .where(
+                projects_visible_to_client(client_id),
+                Project.status == "running",
+                not_deleted(Project),
+            )
         )
         running_projects_count = (await db.scalar(running_projects_stmt)) or 0
         open_leads_count = 0
