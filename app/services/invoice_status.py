@@ -11,8 +11,10 @@ LOCKED_STATUSES = TERMINAL_STATUSES  # cannot edit or soft-delete
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "draft": frozenset({"sent", "paid", "cancelled", "void"}),
-    "sent": frozenset({"paid", "overdue", "cancelled", "void"}),
-    "overdue": frozenset({"paid", "sent", "cancelled", "void"}),
+    "sent": frozenset({"paid", "overdue", "proof_pending", "cancelled", "void"}),
+    "overdue": frozenset({"paid", "sent", "proof_pending", "cancelled", "void"}),
+    # Client uploaded payment proof — founder verifies → paid
+    "proof_pending": frozenset({"paid", "sent", "overdue", "cancelled", "void"}),
     "paid": frozenset(),
     "cancelled": frozenset(),
     "void": frozenset(),
@@ -66,6 +68,25 @@ def assert_can_pay(invoice: Any) -> None:
     if invoice.status in ("cancelled", "void"):
         raise InvoiceStatusError("Cannot pay a cancelled invoice")
     assert_transition(invoice.status, "paid")
+
+
+def assert_can_upload_payment_proof(invoice: Any) -> None:
+    if invoice.status == "paid":
+        raise InvoiceStatusError("Invoice is already paid")
+    if invoice.status in ("cancelled", "void"):
+        raise InvoiceStatusError("Cannot upload proof for a cancelled invoice")
+    if invoice.status == "draft":
+        raise InvoiceStatusError("Invoice must be sent before uploading payment proof")
+    if invoice.status not in ("sent", "overdue", "proof_pending"):
+        raise InvoiceStatusError(f"Cannot upload payment proof while invoice is {invoice.status}")
+
+
+def assert_can_verify_payment(invoice: Any) -> None:
+    if invoice.status == "paid":
+        return
+    if not getattr(invoice, "payment_proof_object_key", None):
+        raise InvoiceStatusError("Upload payment proof before verifying")
+    assert_can_pay(invoice)
 
 
 def assert_can_cancel(invoice: Any) -> None:

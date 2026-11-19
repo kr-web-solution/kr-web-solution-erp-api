@@ -507,6 +507,20 @@ class Invoice(SoftDeleteMixin, TimestampMixin, Base):
     upi_qr_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Client payment proof (UPI/bank screenshot/PDF) — founder verifies then marks paid
+    payment_proof_object_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    payment_proof_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    payment_proof_content_type: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    payment_proof_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    payment_proof_uploaded_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    payment_proof_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    payment_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    payment_verified_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
     # Reminders & Email Delivery Tracking
     reminder_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_reminder_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

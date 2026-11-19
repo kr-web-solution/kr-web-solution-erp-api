@@ -1,6 +1,6 @@
 from datetime import date, datetime, timezone, timedelta
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, status, Query, Response
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -14,6 +14,8 @@ from ..services.invoice_status import (
     assert_can_cancel,
     assert_can_pay,
     assert_can_send,
+    assert_can_upload_payment_proof,
+    assert_can_verify_payment,
     assert_deletable,
     assert_editable,
 )
@@ -97,6 +99,12 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
         covers_from=inv.covers_from,
         covers_to=inv.covers_to,
         monthly_rate_paise=inv.monthly_rate_paise,
+        payment_proof_filename=getattr(inv, "payment_proof_filename", None),
+        payment_proof_content_type=getattr(inv, "payment_proof_content_type", None),
+        payment_proof_uploaded_at=getattr(inv, "payment_proof_uploaded_at", None),
+        payment_proof_note=getattr(inv, "payment_proof_note", None),
+        has_payment_proof=bool(getattr(inv, "payment_proof_object_key", None)),
+        payment_verified_at=getattr(inv, "payment_verified_at", None),
         created_at=inv.created_at,
         items=[InvoiceItemResponse.model_validate(it) for it in (inv.items or [])],
         payment_upi_id=pay.get("upi_id"),
@@ -109,6 +117,59 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
         gst_enabled=gst_is_enabled(settings) if settings else False,
     )
     return resp
+
+
+async def _send_paid_receipt_email(db: AsyncSession, inv: Invoice, st: Optional[Settings]) -> None:
+    """Best-effort paid receipt email after status is already committed as paid."""
+    if not st or not st.smtp_host or not st.smtp_from_email:
+        return
+    if not inv.client or not inv.client.email:
+        return
+    pdf_bytes = generate_invoice_pdf(
+        invoice=inv,
+        client=inv.client,
+        settings=st,
+        items=inv.items,
+        project=inv.project,
+    )
+    from ..services.email_html import compose_invoice_client_email
+
+    _kind, subject, html, plain, attachment_name = compose_invoice_client_email(
+        company_name=st.company_name,
+        company_address=st.company_address or "",
+        company_gstin=st.company_gstin or "",
+        company_logo_url=st.company_logo_url or "/brand/krws-mark.png",
+        client_name=inv.client.primary_contact_name or inv.client.name,
+        invoice_number=inv.invoice_number,
+        total_paise=inv.total_paise,
+        due_date=inv.due_date,
+        issue_date=inv.issue_date,
+        paid_at=inv.paid_at,
+        bank_upi_details=st.bank_upi_details or "",
+        invoice_type=inv.invoice_type or "invoice",
+        project_name=(inv.project.name if inv.project else "") or "",
+        notes=inv.notes or "",
+        status="paid",
+        force_kind="paid",
+    )
+    try:
+        await send_email_async(
+            to_email=inv.client.email,
+            subject=subject,
+            body=html,
+            plain_body=plain,
+            settings=st,
+            attachment_bytes=pdf_bytes,
+            attachment_filename=attachment_name,
+            cc_email=st.invoice_cc_email,
+            is_html=True,
+        )
+        inv.email_status = "sent"
+        inv.last_emailed_at = datetime.now(timezone.utc)
+        await db.commit()
+    except Exception:
+        # Paid status is already committed; do not roll back settlement
+        pass
 
 
 def _assert_invoice_access(inv: Invoice, user: User) -> None:
@@ -875,56 +936,163 @@ async def mark_invoice_as_paid(
     await db.commit()
     await db.refresh(inv)
 
-    # Send paid receipt email with PAID stamp PDF (if client has email and SMTP is configured)
     st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
-    if st and st.smtp_host and st.smtp_from_email and inv.client and inv.client.email:
-        pdf_bytes = generate_invoice_pdf(
-            invoice=inv,
-            client=inv.client,
-            settings=st,
-            items=inv.items,
-            project=inv.project
-        )
-        from ..services.email_html import compose_invoice_client_email
-
-        _kind, subject, html, plain, attachment_name = compose_invoice_client_email(
-            company_name=st.company_name,
-            company_address=st.company_address or "",
-            company_gstin=st.company_gstin or "",
-            company_logo_url=st.company_logo_url or "/brand/krws-mark.png",
-            client_name=inv.client.primary_contact_name or inv.client.name,
-            invoice_number=inv.invoice_number,
-            total_paise=inv.total_paise,
-            due_date=inv.due_date,
-            issue_date=inv.issue_date,
-            paid_at=inv.paid_at,
-            bank_upi_details=st.bank_upi_details or "",
-            invoice_type=inv.invoice_type or "invoice",
-            project_name=(inv.project.name if inv.project else "") or "",
-            notes=inv.notes or "",
-            status="paid",
-            force_kind="paid",
-        )
-        try:
-            await send_email_async(
-                to_email=inv.client.email,
-                subject=subject,
-                body=html,
-                plain_body=plain,
-                settings=st,
-                attachment_bytes=pdf_bytes,
-                attachment_filename=attachment_name,
-                cc_email=st.invoice_cc_email,
-                is_html=True,
-            )
-            inv.email_status = "sent"
-            inv.last_emailed_at = datetime.now(timezone.utc)
-            await db.commit()
-        except Exception:
-            # Paid status is already committed; log notification warning
-            pass
-
+    await _send_paid_receipt_email(db, inv, st)
     return format_invoice_response(inv, st)
+
+
+@router.post("/{invoice_id}/payment-proof", response_model=InvoiceResponse)
+async def upload_payment_proof(
+    invoice_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    note: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Client (or founder) uploads bank/UPI payment proof. Status → proof_pending."""
+    if current_user.role == "worker":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workers cannot upload payment proof")
+    if current_user.role != "client" and not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    from ..services.invoice_payment_proof import save_payment_proof
+
+    stmt = (
+        select(Invoice)
+        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
+    inv = (await db.execute(stmt)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+    _assert_invoice_access(inv, current_user)
+    assert_can_upload_payment_proof(inv)
+
+    key, original, content_type, _size = await save_payment_proof(inv.id, file)
+    before = {"status": inv.status, "has_payment_proof": bool(inv.payment_proof_object_key)}
+    inv.payment_proof_object_key = key
+    inv.payment_proof_filename = original
+    inv.payment_proof_content_type = content_type
+    inv.payment_proof_uploaded_at = datetime.now(timezone.utc)
+    inv.payment_proof_uploaded_by = current_user.id
+    inv.payment_proof_note = (note or "").strip() or None
+    inv.payment_verified_at = None
+    inv.payment_verified_by = None
+    if inv.status in ("sent", "overdue"):
+        apply_status(inv, "proof_pending")
+
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "upload_payment_proof",
+        before=before,
+        after={
+            "status": inv.status,
+            "payment_proof_filename": inv.payment_proof_filename,
+            "has_payment_proof": True,
+        },
+        request=request,
+    )
+    await db.commit()
+    await db.refresh(inv)
+    st = await _load_settings(db)
+    return format_invoice_response(inv, st)
+
+
+@router.get("/{invoice_id}/payment-proof")
+async def download_payment_proof(
+    invoice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Download payment proof file (client own invoice or founder/admin)."""
+    if current_user.role == "worker":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    if current_user.role != "client" and not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    from ..services.invoice_payment_proof import read_payment_proof
+
+    stmt = select(Invoice).where(Invoice.id == invoice_id, not_deleted(Invoice))
+    inv = (await db.execute(stmt)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+    _assert_invoice_access(inv, current_user)
+    if not inv.payment_proof_object_key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No payment proof uploaded")
+
+    data = read_payment_proof(inv.payment_proof_object_key, inv.id)
+    filename = inv.payment_proof_filename or "payment-proof"
+    media = inv.payment_proof_content_type or "application/octet-stream"
+    return Response(
+        content=data,
+        media_type=media,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@router.post("/{invoice_id}/verify-payment", response_model=InvoiceResponse)
+async def verify_payment_and_mark_paid(
+    invoice_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    """Founder/admin verifies uploaded proof → paid + send paid invoice receipt email."""
+    stmt = (
+        select(Invoice)
+        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
+    inv = (await db.execute(stmt)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+
+    assert_can_verify_payment(inv)
+
+    before_status = inv.status
+    if inv.status != "paid":
+        apply_status(inv, "paid")
+        inv.paid_at = datetime.now(timezone.utc)
+    inv.payment_verified_at = datetime.now(timezone.utc)
+    inv.payment_verified_by = current_user.id
+
+    if inv.ledger == "maintenance" and inv.project_id and inv.covers_to:
+        await _hold_maintenance_emails(db, inv.project_id, inv.covers_to)
+
+    act_stmt = select(LateFeeAction).where(
+        LateFeeAction.invoice_id == invoice_id,
+        LateFeeAction.status.in_(["pending", "scheduled"]),
+    )
+    for act in (await db.execute(act_stmt)).scalars().all():
+        act.status = "waived"
+        act.decided_by = current_user.id
+        act.decided_at = datetime.now(timezone.utc)
+
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "verify_payment",
+        before={"status": before_status},
+        after={
+            "status": inv.status,
+            "paid_at": inv.paid_at,
+            "payment_verified_at": inv.payment_verified_at,
+        },
+        request=request,
+    )
+    await db.commit()
+    await db.refresh(inv)
+
+    st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+    await _send_paid_receipt_email(db, inv, st)
+    return format_invoice_response(inv, st)
+
 
 # ----------------- Late Fee Actions (Founder CEO Only) -----------------
 

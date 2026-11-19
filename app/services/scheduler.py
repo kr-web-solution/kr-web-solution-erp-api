@@ -371,7 +371,10 @@ async def step_c_check_and_mark_overdue(today: date) -> List[dict]:
                 Invoice.paid_at.is_(None),
                 Invoice.due_date < today,
                 Invoice.overdue_notified_at.is_(None),
-                Invoice.status != "paid"
+                # Do not clobber proof awaiting founder verification (or terminal states)
+                Invoice.status.notin_(
+                    ["paid", "cancelled", "void", "proof_pending"]
+                ),
             )
         )
         overdue_invs = (await session.execute(od_stmt)).scalars().all()

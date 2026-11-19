@@ -501,6 +501,13 @@ class InvoiceResponse(OrmBase):
     covers_from: Optional[date] = None
     covers_to: Optional[date] = None
     monthly_rate_paise: Optional[int] = None
+    # Payment proof (client upload → founder verify)
+    payment_proof_filename: Optional[str] = None
+    payment_proof_content_type: Optional[str] = None
+    payment_proof_uploaded_at: Optional[datetime] = None
+    payment_proof_note: Optional[str] = None
+    has_payment_proof: bool = False
+    payment_verified_at: Optional[datetime] = None
     created_at: datetime
     items: List[InvoiceItemResponse] = []
     # Resolved payment hints for clients (company default or override)
