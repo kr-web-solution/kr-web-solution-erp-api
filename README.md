@@ -96,7 +96,7 @@ Create `kr-erp-api/.env` (modeled after `.env.example`):
 
 ```env
 # Database (PostgreSQL with asyncpg driver)
-DATABASE_URL=postgresql+asyncpg://postgres:udhaya@localhost:5432/kr-web-solution-erp
+DATABASE_URL=postgresql+asyncpg://postgres:CHANGE_ME@localhost:5432/kr-web-solution-erp
 
 # Application & Environment
 PROJECT_NAME="KR Workspace CRM + ERP API"
@@ -132,6 +132,12 @@ MICROSOFT_CLIENT_SECRET=
 
 # CORS Allowed Origins
 BACKEND_CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000"]
+
+# JWT / encryption (required outside local/dev — never commit real values)
+# SECRET_KEY: openssl rand -hex 32
+# ENCRYPTION_KEY: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Rotating SECRET_KEY invalidates all sessions and invite/reset tokens.
+# Rotating ENCRYPTION_KEY breaks decryption of stored SMTP passwords — re-save them in Settings.
 ```
 
 **Bootstrap login**: when the `users` table has no active rows, seed creates one `admin` from `SUPER_ADMIN_*`. There are **no** dummy seeded logins. Additional people are invited from Settings → People (set-password email). Staff emails must be `@krwebsolution.com`; client/lead emails must not use that domain.

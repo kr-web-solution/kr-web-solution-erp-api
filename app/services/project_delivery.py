@@ -1,6 +1,6 @@
 """Helpers for project delivery phases, checklists, and engagement sync."""
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import select
@@ -8,13 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..common.workflow import (
-    DELIVERY_MAX_STAGE,
     DELIVERY_MIN_STAGE,
     STAGES_BY_NUMBER,
-    WARRANTY_DEFAULT_DAYS,
     build_project_delivery_checklist_seed,
 )
-from ..models import Engagement, EngagementChecklistItem, Project, ProjectChecklistItem
+from ..models import Engagement, Project, ProjectChecklistItem
 
 
 def seed_project_checklist(project_id: str, done_through_stage: int = 0) -> List[ProjectChecklistItem]:

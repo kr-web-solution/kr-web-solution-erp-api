@@ -1,19 +1,28 @@
 from datetime import date, datetime, timezone, timedelta
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from ..core.dependencies import get_db, get_current_user, require_founder_ceo
+from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
 from ..core.database import not_deleted
-from ..models import Invoice, InvoiceItem, Client, Project, Settings, EmailTemplate, RecurringInvoice, User, LateFeeAction
+from ..models import Invoice, InvoiceItem, Settings, RecurringInvoice, User, LateFeeAction
+from ..services.audit import snapshot_entity, write_audit
+from ..services.invoice_status import (
+    apply_status,
+    assert_can_cancel,
+    assert_can_pay,
+    assert_can_send,
+    assert_deletable,
+    assert_editable,
+)
 from ..schemas import (
     InvoiceResponse, InvoiceCreate, InvoiceUpdate, InvoiceItemResponse,
     RecurringInvoiceResponse, RecurringInvoiceCreate, RecurringInvoiceUpdate,
     LateFeeActionResponse, LateFeeDecisionRequest, CreditNoteCreate,
 )
-from ..services.pdf import generate_invoice_pdf, format_inr
+from ..services.pdf import generate_invoice_pdf
 from ..services.email import send_email_async
 from ..services.tax_payroll import (
     effective_tax_rate,
@@ -95,6 +104,20 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
     )
     return resp
 
+
+def _assert_invoice_access(inv: Invoice, user: User) -> None:
+    if user.role == "worker":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Workers cannot view invoices"
+        )
+    if user.role == "client":
+        if inv.client_id != user.client_id or inv.status == "draft":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+        return
+    if not is_privileged(user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+
 # ----------------- Invoices -----------------
 
 @router.get("", response_model=List[InvoiceResponse])
@@ -106,6 +129,8 @@ async def list_invoices(
 ):
     if current_user.role == "worker":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workers cannot view invoices")
+    if current_user.role != "client" and not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     stmt = (
         select(Invoice)
@@ -159,10 +184,26 @@ async def create_recurring_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    rec = RecurringInvoice(**payload.model_dump())
-    db.add(rec)
+    from ..services.client_project import create_maintenance_plan
+
+    rec = await create_maintenance_plan(
+        db,
+        project_id=payload.project_id,
+        client_id=payload.client_id,
+        amount_paise=payload.amount_paise,
+        send_day=payload.send_day,
+        due_after_days=payload.due_after_days,
+        reminder_every_days=payload.reminder_every_days,
+        starts_on=payload.starts_on,
+        ends_on=payload.ends_on,
+        line_items_template=payload.line_items_template,
+        tax_rate_percent=payload.tax_rate_percent,
+        day_of_month=payload.day_of_month,
+        next_run_date=payload.next_run_date,
+        active=payload.active,
+        notes=payload.notes,
+    )
     await db.commit()
-    await db.refresh(rec)
 
     stmt = select(RecurringInvoice).options(selectinload(RecurringInvoice.client)).where(RecurringInvoice.id == rec.id)
     ref = (await db.execute(stmt)).scalars().first()
@@ -177,7 +218,11 @@ async def update_recurring_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = select(RecurringInvoice).options(selectinload(RecurringInvoice.client)).where(RecurringInvoice.id == recurring_id)
+    stmt = (
+        select(RecurringInvoice)
+        .options(selectinload(RecurringInvoice.client))
+        .where(RecurringInvoice.id == recurring_id, not_deleted(RecurringInvoice))
+    )
     ref = (await db.execute(stmt)).scalars().first()
     if not ref:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurring invoice not found")
@@ -197,7 +242,9 @@ async def delete_recurring_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = select(RecurringInvoice).where(RecurringInvoice.id == recurring_id)
+    stmt = select(RecurringInvoice).where(
+        RecurringInvoice.id == recurring_id, not_deleted(RecurringInvoice)
+    )
     ref = (await db.execute(stmt)).scalars().first()
     if not ref:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurring invoice not found")
@@ -211,13 +258,10 @@ async def get_invoice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.role == "worker":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workers cannot view invoices")
-
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     res = await db.execute(stmt)
     inv = res.scalars().first()
@@ -225,9 +269,7 @@ async def get_invoice(
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
 
-    if current_user.role == "client":
-        if inv.client_id != current_user.client_id or inv.status == "draft":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    _assert_invoice_access(inv, current_user)
 
     st = await _load_settings(db)
     return format_invoice_response(inv, st)
@@ -235,14 +277,16 @@ async def get_invoice(
 @router.post("", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
 async def create_invoice(
     payload: InvoiceCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
-    # Verify client exists
-    c_res = await db.execute(select(Client).where(Client.id == payload.client_id))
-    client = c_res.scalars().first()
-    if not client:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client not found")
+    from ..services.client_project import create_invoice_guards, assert_clients_exist
+
+    await assert_clients_exist(db, [payload.client_id])
+    await create_invoice_guards(
+        db, project_id=payload.project_id, client_id=payload.client_id
+    )
 
     # ATOMIC SEQUENCE INCREMENT with SELECT ... FOR UPDATE
     settings_stmt = select(Settings).where(Settings.id == "default").with_for_update()
@@ -251,7 +295,7 @@ async def create_invoice(
     if not st:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Settings record not found")
 
-    from ..services.invoice_numbers import allocate_invoice_number
+    from ..services.invoice_numbers import assign_unique_invoice_number
     from ..services.project_money import ledger_for
 
     raw_type = payload.invoice_type or "custom_dev"
@@ -260,16 +304,6 @@ async def create_invoice(
     if raw_type == "maintenance":
         raw_type = "amc"
 
-    try:
-        invoice_number = await allocate_invoice_number(
-            db,
-            invoice_type=raw_type,
-            issue_date=payload.issue_date,
-            settings_row=st,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
-
     # Calculate subtotal from items; GST only when enabled in Settings
     subtotal_paise = sum(int(round(float(item.quantity) * item.unit_rate_paise)) for item in payload.items)
     tax_rate = effective_tax_rate(st, payload.tax_rate_percent)
@@ -277,7 +311,7 @@ async def create_invoice(
     total_paise = subtotal_paise + tax_paise
 
     invoice = Invoice(
-        invoice_number=invoice_number,
+        invoice_number="",
         invoice_type=raw_type,
         ledger=ledger_for(raw_type),
         client_id=payload.client_id,
@@ -297,8 +331,16 @@ async def create_invoice(
         covers_to=payload.covers_to,
         monthly_rate_paise=payload.monthly_rate_paise,
     )
-    db.add(invoice)
-    await db.flush()
+    try:
+        await assign_unique_invoice_number(
+            db,
+            invoice,
+            invoice_type=raw_type,
+            issue_date=payload.issue_date,
+            settings_row=st,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
     for item in payload.items:
         amt = int(round(float(item.quantity) * item.unit_rate_paise))
@@ -313,6 +355,15 @@ async def create_invoice(
     if raw_type == "amc" and payload.project_id and payload.covers_to:
         await _hold_maintenance_emails(db, payload.project_id, payload.covers_to)
 
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        invoice.id,
+        "create",
+        after=snapshot_entity(invoice, ["invoice_number", "status", "total_paise", "client_id", "project_id"]),
+        request=request,
+    )
     await db.commit()
 
     # Re-fetch with loaded items
@@ -328,28 +379,24 @@ async def create_invoice(
 @router.post("/{invoice_id}/cancel", response_model=InvoiceResponse)
 async def cancel_invoice(
     invoice_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo),
+    current_user: User = Depends(require_founder_ceo),
 ):
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
-    if inv.status == "paid":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot cancel a paid invoice. Issue a credit note instead.",
-        )
-    if inv.status in ("cancelled", "void"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invoice is already cancelled")
-    if inv.invoice_type == "credit_note":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cancel the credit note by deleting it if still unpaid")
-
-    inv.status = "cancelled"
+    before = {"status": inv.status}
+    assert_can_cancel(inv)
+    apply_status(inv, "cancelled")
+    await write_audit(
+        db, current_user, "invoices", inv.id, "cancel", before=before, after={"status": inv.status}, request=request
+    )
     await db.commit()
     await db.refresh(inv)
     st = await _load_settings(db)
@@ -366,7 +413,7 @@ async def create_credit_note(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     parent = (await db.execute(stmt)).scalars().first()
     if not parent:
@@ -398,20 +445,10 @@ async def create_credit_note(
     tax_paise = compute_tax_paise(credit_sub, tax_rate)
     total_paise = credit_sub + tax_paise
 
-    from ..services.invoice_numbers import allocate_invoice_number
+    from ..services.invoice_numbers import assign_unique_invoice_number
     from ..services.project_money import ledger_for
 
     today = date.today()
-    try:
-        invoice_number = await allocate_invoice_number(
-            db,
-            invoice_type="credit_note",
-            issue_date=today,
-            settings_row=st,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
-
     reason = (payload.reason or "").strip()
     notes = f"Credit note for {parent.invoice_number}"
     if reason:
@@ -420,7 +457,7 @@ async def create_credit_note(
     # Paid parent → credit note marked paid (refund applied). Unpaid → sent credit reduces outstanding.
     cn_status = "paid" if parent.status == "paid" else "sent"
     credit = Invoice(
-        invoice_number=invoice_number,
+        invoice_number="",
         invoice_type="credit_note",
         ledger=ledger_for(parent.invoice_type or "custom_dev"),
         client_id=parent.client_id,
@@ -438,8 +475,16 @@ async def create_credit_note(
         upi_id_override=parent.upi_id_override,
         upi_qr_url=parent.upi_qr_url,
     )
-    db.add(credit)
-    await db.flush()
+    try:
+        await assign_unique_invoice_number(
+            db,
+            credit,
+            invoice_type="credit_note",
+            issue_date=today,
+            settings_row=st,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
     db.add(
         InvoiceItem(
             invoice_id=credit.id,
@@ -465,30 +510,58 @@ async def create_credit_note(
 async def update_invoice(
     invoice_id: str,
     payload: InvoiceUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo)
 ):
     from ..models import InvoiceAuditLog
 
-    stmt = select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id)
+    stmt = select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id, not_deleted(Invoice))
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
-    if inv.status in ("cancelled", "void"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot edit a cancelled invoice")
-    if inv.status == "paid":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Paid invoices are locked. Issue a credit note instead.",
-        )
+    assert_editable(inv.status)
 
     old_subtotal = int(inv.subtotal_paise or 0)
     was_sent = inv.status in ("sent", "overdue")
+    before = snapshot_entity(
+        inv,
+        ["status", "notes", "due_date", "issue_date", "tax_rate_percent", "subtotal_paise", "total_paise"],
+    )
     update_dict = payload.model_dump(exclude_unset=True)
+    requested_status = update_dict.pop("status", None)
+    # Defense in depth if a future field sneaks onto the schema
+    if "project_id" in update_dict or "client_id" in update_dict:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="project_id and client_id cannot be changed on an existing invoice",
+        )
     new_items = update_dict.pop("items", None)
 
+    _ALLOWED_INVOICE_PATCH = {
+        "invoice_type",
+        "issue_date",
+        "due_date",
+        "tax_rate_percent",
+        "notes",
+        "status",
+        "upi_id_override",
+        "upi_qr_url",
+        "period_months",
+        "covers_from",
+        "covers_to",
+        "monthly_rate_paise",
+    }
     for k, v in update_dict.items():
+        if k not in _ALLOWED_INVOICE_PATCH:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Field '{k}' cannot be updated on an invoice",
+            )
         setattr(inv, k, v)
+
+    if requested_status is not None:
+        apply_status(inv, requested_status)
 
     if new_items is not None:
         # Delete existing items and add new items
@@ -534,13 +607,26 @@ async def update_invoice(
             note="Re-send the updated invoice to the client.",
         ))
 
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "update",
+        before=before,
+        after=snapshot_entity(
+            inv,
+            ["status", "notes", "due_date", "issue_date", "tax_rate_percent", "subtotal_paise", "total_paise"],
+        ),
+        request=request,
+    )
     await db.commit()
 
     # Re-fetch
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     res = await db.execute(stmt)
     updated_inv = res.scalars().first()
@@ -557,8 +643,7 @@ async def delete_invoice(
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
 
-    if inv.status == "paid":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete paid invoice")
+    assert_deletable(inv.status)
 
     inv.soft_delete()
     await db.commit()
@@ -570,21 +655,16 @@ async def download_invoice_pdf(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.role == "worker":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
 
-    if current_user.role == "client":
-        if inv.client_id != current_user.client_id or inv.status == "draft":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    _assert_invoice_access(inv, current_user)
 
     st_res = await db.execute(select(Settings).where(Settings.id == "default"))
     settings_obj = st_res.scalars().first()
@@ -609,13 +689,14 @@ async def download_invoice_pdf(
 @router.post("/{invoice_id}/send")
 async def send_invoice_email(
     invoice_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
@@ -623,6 +704,7 @@ async def send_invoice_email(
 
     if not inv.client or not inv.client.email:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client has no email address")
+    assert_can_send(inv)
 
     st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
 
@@ -682,9 +764,20 @@ async def send_invoice_email(
     inv.email_status = "sent"
     inv.email_error = None
     inv.last_emailed_at = datetime.now(timezone.utc)
+    before_status = inv.status
     # Never flip a paid invoice back to "sent"
     if inv.status == "draft":
-        inv.status = "sent"
+        apply_status(inv, "sent")
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "send",
+        before={"status": before_status, "email_status": "pending"},
+        after={"status": inv.status, "email_status": inv.email_status},
+        request=request,
+    )
     await db.commit()
 
     kind_label = {
@@ -703,20 +796,24 @@ async def send_invoice_email(
 @router.post("/{invoice_id}/mark-paid", response_model=InvoiceResponse)
 async def mark_invoice_as_paid(
     invoice_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo)
 ):
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
 
-    inv.status = "paid"
-    inv.paid_at = datetime.now(timezone.utc)
+    before_status = inv.status
+    assert_can_pay(inv)
+    if inv.status != "paid":
+        apply_status(inv, "paid")
+        inv.paid_at = datetime.now(timezone.utc)
     if inv.ledger == "maintenance" and inv.project_id and inv.covers_to:
         await _hold_maintenance_emails(db, inv.project_id, inv.covers_to)
 
@@ -731,6 +828,16 @@ async def mark_invoice_as_paid(
         act.decided_by = current_user.id
         act.decided_at = datetime.now(timezone.utc)
 
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "pay",
+        before={"status": before_status},
+        after={"status": inv.status, "paid_at": inv.paid_at},
+        request=request,
+    )
     await db.commit()
     await db.refresh(inv)
 
@@ -880,14 +987,7 @@ async def execute_late_fee_decision(
         if not st:
             raise HTTPException(status_code=500, detail="Default settings missing")
 
-        from ..services.invoice_numbers import allocate_invoice_number
-
-        lf_number = await allocate_invoice_number(
-            db,
-            invoice_type="late_fee",
-            issue_date=date.today(),
-            settings_row=st,
-        )
+        from ..services.invoice_numbers import assign_unique_invoice_number
 
         subtotal = action.fee_paise
         tax_rate = effective_tax_rate(st)
@@ -896,7 +996,7 @@ async def execute_late_fee_decision(
         today = date.today()
 
         lf_invoice = Invoice(
-            invoice_number=lf_number,
+            invoice_number="",
             invoice_type="late_fee",
             parent_invoice_id=inv.id,
             client_id=inv.client_id,
@@ -911,8 +1011,13 @@ async def execute_late_fee_decision(
             email_status="pending",
             notes=f"Late payment fee for Invoice {inv.invoice_number}. {action.reason}"
         )
-        db.add(lf_invoice)
-        await db.flush()
+        await assign_unique_invoice_number(
+            db,
+            lf_invoice,
+            invoice_type="late_fee",
+            issue_date=today,
+            settings_row=st,
+        )
 
         db.add(InvoiceItem(
             invoice_id=lf_invoice.id,
@@ -1011,7 +1116,7 @@ async def decide_late_fee_action(
     inv_stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(inv_stmt)).scalars().first()
     if not inv:

@@ -6,7 +6,7 @@ import uuid
 from typing import Optional
 
 from sqlalchemy import String, Integer, Boolean, Text, ForeignKey, Index, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .core.database import Base, SoftDeleteMixin, TimestampMixin
 

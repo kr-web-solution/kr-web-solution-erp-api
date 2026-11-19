@@ -10,7 +10,8 @@ VIEW_STATEMENTS = [
       COUNT(*)::bigint AS invoice_count,
       COALESCE(SUM(total_paise), 0)::bigint AS billed_paise
     FROM invoices
-    WHERE deleted_at IS NULL AND status <> 'draft'
+    WHERE deleted_at IS NULL
+      AND status NOT IN ('draft', 'cancelled', 'void')
     GROUP BY 1, 2, 3
     """,
     """
@@ -45,7 +46,9 @@ VIEW_STATEMENTS = [
       COUNT(i.id) FILTER (WHERE i.status IN ('sent', 'overdue'))::bigint AS open_invoice_count,
       COALESCE(SUM(i.total_paise) FILTER (WHERE i.status IN ('sent', 'overdue')), 0)::bigint AS outstanding_paise,
       COALESCE(SUM(i.total_paise) FILTER (WHERE i.status = 'paid'), 0)::bigint AS paid_paise,
-      COALESCE(SUM(i.total_paise) FILTER (WHERE i.status <> 'draft'), 0)::bigint AS billed_paise
+      COALESCE(SUM(i.total_paise) FILTER (
+        WHERE i.status NOT IN ('draft', 'cancelled', 'void')
+      ), 0)::bigint AS billed_paise
     FROM clients c
     LEFT JOIN invoices i ON i.client_id = c.id AND i.deleted_at IS NULL
     WHERE c.deleted_at IS NULL

@@ -5,10 +5,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select, text, func, and_, or_
+from sqlalchemy import select, text, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from ..core.database import AsyncSessionLocal, engine
-from ..models import RecurringInvoice, Invoice, InvoiceItem, Settings, User, LateFeeAction, Client, Project
+from ..models import RecurringInvoice, Invoice, InvoiceItem, Settings, User, LateFeeAction
 from .pdf import generate_invoice_pdf
 from .email import send_email_async
 logger = logging.getLogger("kr.scheduler")
@@ -102,15 +103,10 @@ async def step_a_generate_recurring_invoices(today: date) -> List[str]:
             if not st:
                 continue
 
-            from .invoice_numbers import allocate_invoice_number
+            from .invoice_numbers import assign_unique_invoice_number, is_recurring_period_conflict
+            from .audit import write_audit
 
             issue_date = date(today.year, today.month, 1)
-            inv_number = await allocate_invoice_number(
-                session,
-                invoice_type="maintenance",
-                issue_date=issue_date,
-                settings_row=st,
-            )
 
             # Full month is created on the 1st. Email waits for the send day.
             subtotal = rec.amount_paise or 0
@@ -122,7 +118,7 @@ async def step_a_generate_recurring_invoices(today: date) -> List[str]:
             due_date = send_on + timedelta(days=rec.due_after_days or 5)
 
             new_inv = Invoice(
-                invoice_number=inv_number,
+                invoice_number="",
                 invoice_type="maintenance",
                 ledger="maintenance",
                 client_id=rec.client_id,
@@ -143,8 +139,36 @@ async def step_a_generate_recurring_invoices(today: date) -> List[str]:
                 email_retry_count=0,
                 notes=rec.notes or f"Monthly Maintenance - {period_key}"
             )
-            session.add(new_inv)
-            await session.flush()
+            try:
+                await assign_unique_invoice_number(
+                    session,
+                    new_inv,
+                    invoice_type="maintenance",
+                    issue_date=issue_date,
+                    settings_row=st,
+                )
+            except IntegrityError as exc:
+                if is_recurring_period_conflict(exc):
+                    rec.next_run_date = first_of_next_month(today)
+                    if new_inv in session:
+                        session.expunge(new_inv)
+                    continue
+                raise
+
+            await write_audit(
+                session,
+                None,
+                "invoices",
+                new_inv.id,
+                "create",
+                after={
+                    "invoice_number": new_inv.invoice_number,
+                    "period_key": period_key,
+                    "recurring_id": rec.id,
+                    "note": "scheduler",
+                },
+                note="scheduler",
+            )
 
             # Add line items
             template_items = rec.line_items_template or []
@@ -753,8 +777,71 @@ async def _notify_founders_of_overdue(overdue_list: List[dict]):
 
 _scheduler: Optional[AsyncIOScheduler] = None
 
+
+def _scheduler_decision() -> tuple[bool, str]:
+    """Return (should_start, reason) for logging and start_scheduler."""
+    from urllib.parse import urlparse
+    from ..core.config import settings
+
+    env = (settings.ENVIRONMENT or "").strip().lower()
+    enable_raw = settings.ENABLE_SCHEDULER
+    enable_repr = "unset" if enable_raw is None else str(enable_raw).lower()
+
+    if env == "test":
+        return False, f"ENVIRONMENT={env!r} ENABLE_SCHEDULER={enable_repr} → off (test)"
+
+    if enable_raw is True:
+        explicit_on = True
+        why_default = "ENABLE_SCHEDULER=true"
+    elif enable_raw is False:
+        return False, f"ENVIRONMENT={env!r} ENABLE_SCHEDULER=false → off (explicit)"
+    else:
+        explicit_on = env == "production"
+        why_default = (
+            "ENABLE_SCHEDULER unset; default on only when ENVIRONMENT=production"
+            if explicit_on
+            else "ENABLE_SCHEDULER unset; ENVIRONMENT is not production → off"
+        )
+
+    if not explicit_on:
+        return False, f"ENVIRONMENT={env!r} ENABLE_SCHEDULER={enable_repr} → off ({why_default})"
+
+    if env != "production":
+        raw = (settings.DATABASE_URL or "").replace("postgresql+asyncpg://", "postgresql://")
+        host = (urlparse(raw).hostname or "").lower()
+        if host not in {"localhost", "127.0.0.1", "::1"}:
+            return (
+                False,
+                f"ENVIRONMENT={env!r} ENABLE_SCHEDULER={enable_repr} → off "
+                f"(non-local DB host blocked outside production)",
+            )
+
+    return True, f"ENVIRONMENT={env!r} ENABLE_SCHEDULER={enable_repr} → on ({why_default})"
+
+
+def scheduler_should_start() -> bool:
+    """Decide whether APScheduler jobs may be registered.
+
+    - Explicit ENABLE_SCHEDULER=true/false wins.
+    - Default: on only when ENVIRONMENT=production.
+    - Always off for ENVIRONMENT=test.
+    - Off when DATABASE_URL host is non-local unless ENVIRONMENT=production
+      (blocks local-dev process pointed at a remote DB via tunnel/URL).
+    """
+    ok, _ = _scheduler_decision()
+    return ok
+
+
+def log_scheduler_startup_status() -> None:
+    """One clear startup line: whether the scheduler will run and why."""
+    ok, reason = _scheduler_decision()
+    logger.info("Scheduler startup: %s — %s", "RUNNING" if ok else "NOT RUNNING", reason)
+
+
 def start_scheduler():
     global _scheduler
+    if not scheduler_should_start():
+        return
     if _scheduler is None:
         _scheduler = AsyncIOScheduler()
         # Daily job at 09:00 Asia/Kolkata — generate monthly invoices + overdue
@@ -795,9 +882,16 @@ def start_scheduler():
         except RuntimeError:
             pass
 
+
 def stop_scheduler():
     global _scheduler
     if _scheduler and _scheduler.running:
         _scheduler.shutdown()
         _scheduler = None
         logger.info("Maintenance scheduler stopped.")
+
+
+def registered_job_ids() -> list[str]:
+    if _scheduler is None:
+        return []
+    return [j.id for j in _scheduler.get_jobs()]

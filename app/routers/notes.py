@@ -4,9 +4,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
+from ..core.dependencies import get_db, get_current_user, is_privileged
 from ..core.database import not_deleted
-from ..models import Note, User, Client, Lead
+from ..models import Note, User
 from ..schemas import NoteResponse, NoteCreate
 
 router = APIRouter(prefix="/notes", tags=["Notes"])
@@ -21,7 +21,11 @@ async def list_notes(
     if entity_type == "lead" and not is_privileged(current_user.role):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-    if entity_type == "client" and current_user.role == "client" and current_user.client_id != entity_id:
+    if current_user.role == "client" and (
+        entity_type != "client" or current_user.client_id != entity_id
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    if current_user.role not in ("client", "worker") and not is_privileged(current_user.role):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     stmt = (
@@ -51,6 +55,13 @@ async def create_note(
 
     if payload.entity_type == "lead" and not is_privileged(current_user.role):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only founder can add notes to leads")
+
+    if current_user.role == "client" and (
+        payload.entity_type != "client" or payload.entity_id != current_user.client_id
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    if current_user.role not in ("client", "worker") and not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     note = Note(
         entity_type=payload.entity_type,

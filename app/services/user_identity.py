@@ -12,7 +12,7 @@ from ..core.roles_catalog import (
     role_id_for_code,
 )
 from ..core.lookups_catalog import PARTY_TYPES
-from ..models import User, Role, Client, Lead
+from ..models import User
 from ..schemas import (
     UserResponse,
     RoleBrief,

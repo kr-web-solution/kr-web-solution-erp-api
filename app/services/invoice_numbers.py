@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from typing import Any, Dict, Optional
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from ..models import Invoice, Settings
+
+logger = logging.getLogger("kr.invoice_numbers")
+
+MAX_UNIQUE_RETRIES = 8
 
 # Service label → short code used in the invoice number
 INVOICE_SERVICE_CODES: Dict[str, str] = {
@@ -114,3 +120,67 @@ async def allocate_invoice_number(
     # Keep legacy counter in sync for older tooling / displays
     st.invoice_next_number = max(int(st.invoice_next_number or 1), next_num + 1)
     return candidate
+
+
+def is_invoice_number_conflict(exc: BaseException) -> bool:
+    """True when IntegrityError / UniqueViolation is on invoices.invoice_number."""
+    orig = getattr(exc, "orig", None) or exc
+    sqlstate = getattr(orig, "sqlstate", None)
+    if sqlstate is None:
+        sqlstate = getattr(getattr(orig, "__cause__", None), "sqlstate", None)
+    pgcode = getattr(orig, "pgcode", None)
+    msg = str(orig).lower()
+    unique = sqlstate == "23505" or pgcode == "23505" or "unique" in msg or "duplicate" in msg
+    if not unique:
+        return False
+    return (
+        "invoice_number" in msg
+        or "ix_invoices_invoice_number" in msg
+        or "invoices_invoice_number" in msg
+    )
+
+
+def is_recurring_period_conflict(exc: BaseException) -> bool:
+    orig = getattr(exc, "orig", None) or exc
+    msg = str(orig).lower()
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(
+        getattr(orig, "__cause__", None), "sqlstate", None
+    )
+    unique = sqlstate == "23505" or "unique" in msg or "duplicate" in msg
+    return unique and "uq_invoice_recurring_period" in msg
+
+
+async def assign_unique_invoice_number(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    invoice_type: str = "custom_dev",
+    issue_date: Optional[date] = None,
+    settings_row: Optional[Settings] = None,
+) -> str:
+    """Allocate a number, bind it, flush; retry on UniqueViolation (concurrent creates)."""
+    db.add(invoice)
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, MAX_UNIQUE_RETRIES + 1):
+        number = await allocate_invoice_number(
+            db,
+            invoice_type=invoice_type,
+            issue_date=issue_date,
+            settings_row=settings_row,
+        )
+        invoice.invoice_number = number
+        try:
+            async with db.begin_nested():
+                await db.flush()
+            return number
+        except IntegrityError as exc:
+            if not is_invoice_number_conflict(exc):
+                raise
+            last_exc = exc
+            logger.warning(
+                "invoice_number unique conflict on %s (attempt %s/%s)",
+                number,
+                attempt,
+                MAX_UNIQUE_RETRIES,
+            )
+    raise last_exc or RuntimeError("Failed to allocate a unique invoice number")

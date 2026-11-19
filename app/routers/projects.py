@@ -1,6 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func  # noqa: F401 — delete used in update_project
@@ -11,11 +11,9 @@ from ..core.database import not_deleted
 from ..common.workflow import DELIVERY_MAX_STAGE, DELIVERY_MIN_STAGE, WARRANTY_DEFAULT_DAYS
 from ..models import (
     Project,
-    Client,
     User,
     ProjectWorker,
     RecurringInvoice,
-    ProjectChecklistItem,
     ProjectFeature,
     ProjectFeatureDoc,
     ProjectDocument,
@@ -25,6 +23,8 @@ from ..schemas import (
     ProjectResponse,
     ProjectCreate,
     ProjectUpdate,
+    ProjectClientAdd,
+    ProjectClientBrief,
     ProjectProrataResponse,
     ProjectGoLiveRequest,
     ProjectInvoiceCreateResponse,
@@ -38,6 +38,16 @@ from ..schemas import (
     ProjectFeatureDocResponse,
     ProjectDocumentResponse,
 )
+from ..services.audit import snapshot_entity, write_audit
+from ..services.client_project import (
+    add_client_to_project,
+    create_project as create_project_record,
+    delete_project as delete_project_record,
+    project_has_client,
+    remove_client_from_project,
+    set_project_clients,
+)
+from ..services.project_visibility import client_is_on_project, projects_visible_to_client
 from ..models import Invoice
 from ..services.project_delivery import (
     checklist_progress,
@@ -69,8 +79,56 @@ def sanitize_project_for_role(
     *,
     invoiced_paise: Optional[int] = None,
 ) -> ProjectResponse:
-    resp = ProjectResponse.model_validate(project)
-    resp.client_name = project.client.name if project.client else None
+    # Build from scalar fields only — ORM `clients`/`workers` are not ProjectClientBrief/UserResponse
+    linked = list(getattr(project, "clients", None) or [])
+    if not linked and project.client:
+        linked = [project.client]
+    resp = ProjectResponse.model_validate(
+        {
+            "id": project.id,
+            "name": project.name,
+            "client_id": project.client_id,
+            "description": project.description,
+            "start_date": project.start_date,
+            "end_date": project.end_date,
+            "budget_paise": project.budget_paise,
+            "development_days": getattr(project, "development_days", None),
+            "advance_invoice_id": getattr(project, "advance_invoice_id", None),
+            "balance_invoice_id": getattr(project, "balance_invoice_id", None),
+            "go_live_at": getattr(project, "go_live_at", None),
+            "status": project.status,
+            "delivery_phase": getattr(project, "delivery_phase", None) or 5,
+            "engagement_id": getattr(project, "engagement_id", None),
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+            "clients": [],
+            "client_ids": [],
+            "workers": [],
+        }
+    )
+    # Release-1: API still exposes client_id, but is_primary comes from M2M when present.
+    primary_id = project.client_id
+    for c in linked:
+        # Client ORM objects may carry transient _is_primary from loader
+        if getattr(c, "_is_primary", None) is True:
+            primary_id = c.id
+            break
+    resp.clients = [
+        ProjectClientBrief(
+            id=c.id,
+            name=c.name,
+            is_primary=(c.id == primary_id),
+        )
+        for c in linked
+    ]
+    resp.client_id = primary_id
+    resp.client_ids = [c.id for c in linked] or ([primary_id] if primary_id else [])
+    primary_client = next((c for c in linked if c.id == primary_id), None)
+    resp.client_name = (
+        primary_client.name if primary_client else (
+            project.client.name if project.client else (linked[0].name if linked else None)
+        )
+    )
     resp.workers = [UserResponse.model_validate(w) for w in project.workers]
     resp.delivery_phase = getattr(project, "delivery_phase", None) or 5
     resp.delivery_phase_name = phase_name(resp.delivery_phase)
@@ -109,7 +167,7 @@ def sanitize_project_for_role(
 
 
 async def _project_invoiced_map(db: AsyncSession, project_ids: List[str]) -> dict:
-    """Sum ex-GST project-invoice subtots per project (all statuses)."""
+    """Sum ex-GST development subtots; exclude soft-deleted and cancelled/void (F-043)."""
     if not project_ids:
         return {}
     rows = (
@@ -118,6 +176,7 @@ async def _project_invoiced_map(db: AsyncSession, project_ids: List[str]) -> dic
             .where(
                 Invoice.project_id.in_(project_ids),
                 Invoice.ledger == "development",
+                not_deleted(Invoice),
                 Invoice.status.notin_(["cancelled", "void"]),
             )
             .group_by(Invoice.project_id)
@@ -138,18 +197,25 @@ async def _sanitize_project(
 async def _load_project(db: AsyncSession, project_id: str, *extra_opts) -> Project:
     opts = [
         selectinload(Project.client),
+        selectinload(Project.clients),
         selectinload(Project.workers),
         selectinload(Project.recurring_invoices),
         *extra_opts,
     ]
-    stmt = select(Project).options(*opts).where(Project.id == project_id)
+    stmt = (
+        select(Project)
+        .options(*opts)
+        .where(Project.id == project_id, not_deleted(Project))
+    )
     project = (await db.execute(stmt)).scalars().first()
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project
 
 
-async def _assert_project_access(project: Project, user: User, *, write: bool = False) -> None:
+async def _assert_project_access(
+    project: Project, user: User, *, db: AsyncSession, write: bool = False
+) -> None:
     if is_privileged(user.role):
         return
     if user.role == "worker":
@@ -157,7 +223,7 @@ async def _assert_project_access(project: Project, user: User, *, write: bool = 
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
         return
     if user.role == "client":
-        if write or project.client_id != user.client_id:
+        if write or not await client_is_on_project(db, project.id, user.client_id):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
         return
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
@@ -172,6 +238,7 @@ async def list_projects(
         select(Project)
         .options(
             selectinload(Project.client),
+            selectinload(Project.clients),
             selectinload(Project.workers),
             selectinload(Project.recurring_invoices)
         )
@@ -183,10 +250,12 @@ async def list_projects(
         # Workers see only projects assigned to them
         stmt = stmt.join(Project.workers).where(User.id == current_user.id)
     elif current_user.role == "client":
-        # Clients see only their projects
+        # Clients see projects they are linked to (M2M via project_clients)
         if not current_user.client_id:
             return []
-        stmt = stmt.where(Project.client_id == current_user.client_id)
+        stmt = stmt.where(projects_visible_to_client(current_user.client_id))
+    elif not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     if status_filter and status_filter != "all":
         stmt = stmt.where(Project.status == status_filter)
@@ -211,9 +280,14 @@ async def project_money(
     from ..services.project_money import summarize_invoices
 
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     invoices = (
-        await db.execute(select(Invoice).where(Invoice.project_id == project.id))
+        await db.execute(
+            select(Invoice).where(
+                Invoice.project_id == project.id,
+                not_deleted(Invoice),
+            )
+        )
     ).scalars().all()
     summary = summarize_invoices(project, invoices)
     if current_user.role == "worker":
@@ -227,55 +301,77 @@ async def get_project(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    stmt = (
-        select(Project)
-        .options(
-            selectinload(Project.client),
-            selectinload(Project.workers),
-            selectinload(Project.recurring_invoices)
-        )
-        .where(Project.id == project_id)
-    )
-    res = await db.execute(stmt)
-    project = res.scalars().first()
-
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-
-    if current_user.role == "worker":
-        worker_ids = [w.id for w in project.workers]
-        if current_user.id not in worker_ids:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    elif current_user.role == "client":
-        if project.client_id != current_user.client_id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-
+    project = await _load_project(db, project_id)
+    await _assert_project_access(project, current_user, db=db)
     return await _sanitize_project(db, project, current_user.role)
+
+
+@router.post("/{project_id}/clients", response_model=ProjectResponse)
+async def link_project_client(
+    project_id: str,
+    payload: ProjectClientAdd,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    await add_client_to_project(db, project_id, payload.client_id)
+    await write_audit(
+        db,
+        current_user,
+        "project_clients",
+        project_id,
+        "membership_add",
+        after={"client_id": payload.client_id, "project_id": project_id},
+        request=request,
+    )
+    await db.commit()
+    project = await _load_project(db, project_id)
+    return sanitize_project_for_role(project, "founder_ceo")
+
+
+@router.delete("/{project_id}/clients/{client_id}", response_model=ProjectResponse)
+async def unlink_project_client(
+    project_id: str,
+    client_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    await remove_client_from_project(db, project_id, client_id)
+    await write_audit(
+        db,
+        current_user,
+        "project_clients",
+        project_id,
+        "membership_remove",
+        before={"client_id": client_id, "project_id": project_id},
+        request=request,
+    )
+    await db.commit()
+    project = await _load_project(db, project_id)
+    return sanitize_project_for_role(project, "founder_ceo")
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 async def create_project(
     payload: ProjectCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
-    # Verify client exists
-    c_res = await db.execute(select(Client).where(Client.id == payload.client_id))
-    if not c_res.scalars().first():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client not found")
-
-    project = Project(
+    project = await create_project_record(
+        db,
         name=payload.name,
+        client_ids=payload.client_ids,
         client_id=payload.client_id,
         description=payload.description,
-        start_date=None,
-        end_date=None,
         budget_paise=payload.budget_paise or 0,
         development_days=payload.development_days,
         status="lead",
         delivery_phase=5,
     )
-    db.add(project)
-    await db.flush()
+    from ..services.client_project import resolve_primary_client_id
+
+    primary_id = await resolve_primary_client_id(db, project.id) or project.client_id
     await ensure_project_checklist(db, project, done_through_stage=0)
 
     if payload.worker_ids:
@@ -290,7 +386,7 @@ async def create_project(
         send_day = min(max(1, m.send_day), 28)
 
         rec = RecurringInvoice(
-            client_id=payload.client_id,
+            client_id=primary_id,
             project_id=project.id,
             amount_paise=m.amount_paise,
             send_day=send_day,
@@ -310,20 +406,18 @@ async def create_project(
         )
         db.add(rec)
 
+    await write_audit(
+        db,
+        current_user,
+        "projects",
+        project.id,
+        "create",
+        after=snapshot_entity(project, ["name", "status", "client_id", "budget_paise"]),
+        request=request,
+    )
     await db.commit()
 
-    # Re-fetch with relationships
-    stmt = (
-        select(Project)
-        .options(
-            selectinload(Project.client),
-            selectinload(Project.workers),
-            selectinload(Project.recurring_invoices)
-        )
-        .where(Project.id == project.id)
-    )
-    res = await db.execute(stmt)
-    created_prj = res.scalars().first()
+    created_prj = await _load_project(db, project.id)
     return sanitize_project_for_role(created_prj, "founder_ceo")
 
 
@@ -359,7 +453,7 @@ async def list_project_documents(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     rows = (
         await db.execute(
             select(ProjectDocument)
@@ -411,12 +505,13 @@ async def download_project_document(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     doc = (
         await db.execute(
             select(ProjectDocument).where(
                 ProjectDocument.id == doc_id,
                 ProjectDocument.project_id == project_id,
+                not_deleted(ProjectDocument),
             )
         )
     ).scalars().first()
@@ -438,11 +533,13 @@ async def delete_project_document(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo),
 ):
+    await _load_project(db, project_id)
     doc = (
         await db.execute(
             select(ProjectDocument).where(
                 ProjectDocument.id == doc_id,
                 ProjectDocument.project_id == project_id,
+                not_deleted(ProjectDocument),
             )
         )
     ).scalars().first()
@@ -460,19 +557,7 @@ async def toggle_project_maintenance(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = (
-        select(Project)
-        .options(
-            selectinload(Project.client),
-            selectinload(Project.workers),
-            selectinload(Project.recurring_invoices)
-        )
-        .where(Project.id == project_id)
-    )
-    res = await db.execute(stmt)
-    project = res.scalars().first()
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    project = await _load_project(db, project_id)
 
     if not project.recurring_invoices or len(project.recurring_invoices) == 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No recurring maintenance configured for this project")
@@ -674,22 +759,12 @@ async def create_project_balance_invoice(
 async def update_project(
     project_id: str,
     payload: ProjectUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    stmt = (
-        select(Project)
-        .options(
-            selectinload(Project.client),
-            selectinload(Project.workers),
-            selectinload(Project.recurring_invoices),
-        )
-        .where(Project.id == project_id)
-    )
-    res = await db.execute(stmt)
-    project = res.scalars().first()
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    project = await _load_project(db, project_id)
+    before = snapshot_entity(project, ["name", "status", "client_id", "budget_paise", "description"])
 
     if current_user.role == "worker":
         worker_ids = [w.id for w in project.workers]
@@ -698,17 +773,44 @@ async def update_project(
 
         if payload.status:
             project.status = payload.status
+        await write_audit(
+            db,
+            current_user,
+            "projects",
+            project.id,
+            "update",
+            before=before,
+            after=snapshot_entity(project, ["name", "status", "client_id", "budget_paise", "description"]),
+            request=request,
+        )
         await db.commit()
-        await db.refresh(project)
+        project = await _load_project(db, project_id)
         return sanitize_project_for_role(project, current_user.role)
 
     elif current_user.role == "client":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Clients cannot edit projects")
+    elif not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     update_data = payload.model_dump(exclude_unset=True)
     worker_ids = update_data.pop("worker_ids", None)
     maintenance_amount = update_data.pop("maintenance_amount_paise", None)
     update_data.pop("advance_paise", None)
+    client_ids = update_data.pop("client_ids", None)
+    primary_client_id = update_data.pop("client_id", None)
+
+    if client_ids is not None:
+        await set_project_clients(
+            db,
+            project,
+            client_ids,
+            primary_client_id=primary_client_id,
+        )
+    elif primary_client_id is not None:
+        # Promote an already-linked client to primary, or add+promote
+        if not project_has_client(project, primary_client_id):
+            await add_client_to_project(db, project.id, primary_client_id)
+        project.client_id = primary_client_id
 
     for k, v in update_data.items():
         setattr(project, k, v)
@@ -734,6 +836,16 @@ async def update_project(
     if maintenance_amount is not None:
         await upsert_project_maintenance(db, project, maintenance_amount)
 
+    await write_audit(
+        db,
+        current_user,
+        "projects",
+        project.id,
+        "update",
+        before=before,
+        after=snapshot_entity(project, ["name", "status", "client_id", "budget_paise", "description"]),
+        request=request,
+    )
     await db.commit()
 
     refreshed = await _load_project(db, project.id)
@@ -742,15 +854,20 @@ async def update_project(
 @router.delete("/{project_id}", status_code=status.HTTP_200_OK)
 async def delete_project(
     project_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Project).where(Project.id == project_id, not_deleted(Project)))
-    project = res.scalars().first()
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-
-    project.soft_delete()
+    await delete_project_record(db, project_id)
+    await write_audit(
+        db,
+        current_user,
+        "projects",
+        project_id,
+        "soft_delete",
+        after={"deleted": True},
+        request=request,
+    )
     await db.commit()
     return {"message": "Project deleted successfully"}
 
@@ -764,7 +881,7 @@ async def get_project_delivery(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     await ensure_project_checklist(db, project, done_through_stage=0)
     await db.commit()
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
@@ -793,7 +910,7 @@ async def toggle_project_checklist(
     if current_user.role == "client":
         raise HTTPException(status_code=403, detail="Clients cannot update delivery checklist")
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     item = next((i for i in project.checklist_items if i.id == item_id), None)
     if not item:
         raise HTTPException(status_code=404, detail="Checklist item not found")
@@ -815,7 +932,7 @@ async def advance_project_delivery(
     if current_user.role == "client":
         raise HTTPException(status_code=403, detail="Forbidden")
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
 
     phase = project.delivery_phase or DELIVERY_MIN_STAGE
     stage_items = [i for i in (project.checklist_items or []) if i.stage_number == phase]
@@ -887,7 +1004,7 @@ async def list_project_features(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     stmt = (
         select(ProjectFeature)
         .options(selectinload(ProjectFeature.docs))
@@ -935,7 +1052,7 @@ async def update_project_feature(
     current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    await _assert_project_access(project, current_user)
+    await _assert_project_access(project, current_user, db=db)
     if current_user.role == "client":
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -974,9 +1091,14 @@ async def delete_project_feature(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo),
 ):
+    await _load_project(db, project_id)
     feat = (
         await db.execute(
-            select(ProjectFeature).where(ProjectFeature.id == feature_id, ProjectFeature.project_id == project_id)
+            select(ProjectFeature).where(
+                ProjectFeature.id == feature_id,
+                ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeature),
+            )
         )
     ).scalars().first()
     if not feat:
@@ -998,9 +1120,14 @@ async def create_feature_doc(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo),
 ):
+    await _load_project(db, project_id)
     feat = (
         await db.execute(
-            select(ProjectFeature).where(ProjectFeature.id == feature_id, ProjectFeature.project_id == project_id)
+            select(ProjectFeature).where(
+                ProjectFeature.id == feature_id,
+                ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeature),
+            )
         )
     ).scalars().first()
     if not feat:
@@ -1027,6 +1154,7 @@ async def delete_feature_doc(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo),
 ):
+    await _load_project(db, project_id)
     doc = (
         await db.execute(
             select(ProjectFeatureDoc)
@@ -1035,6 +1163,7 @@ async def delete_feature_doc(
                 ProjectFeatureDoc.id == doc_id,
                 ProjectFeatureDoc.feature_id == feature_id,
                 ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeatureDoc),
             )
         )
     ).scalars().first()

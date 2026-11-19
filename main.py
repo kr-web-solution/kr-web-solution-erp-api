@@ -6,18 +6,16 @@ from app.core.database import init_db
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.middleware import register_middleware
-from app.services.scheduler import start_scheduler, stop_scheduler
+from app.services.scheduler import start_scheduler, stop_scheduler, log_scheduler_startup_status
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     from app.services.object_storage import ensure_buckets
     ensure_buckets()
+    # Production/deploy: schema via alembic one-off; data via CLI only (not on startup).
     await init_db()
-    # Seed development data if database is empty
-    from app.scripts.seed import seed_database_async
-    await seed_database_async()
-    # Start recurring invoices background scheduler
+    log_scheduler_startup_status()
     start_scheduler()
     yield
     stop_scheduler()

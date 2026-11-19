@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
@@ -9,6 +10,8 @@ from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import AuditLog
+
+logger = logging.getLogger("kr.audit")
 
 SECRET_KEYS = {
     "password",
@@ -65,18 +68,40 @@ def diff_snapshots(before: dict[str, Any], after: dict[str, Any]) -> tuple[list[
     return changed, b_out, a_out
 
 
+def _resolve_actor_id(actor: Any = None, actor_id: Optional[str] = None) -> Optional[str]:
+    if actor_id:
+        return str(actor_id)
+    if actor is None:
+        return None
+    if isinstance(actor, str):
+        return actor
+    ident = getattr(actor, "id", None)
+    return str(ident) if ident else None
+
+
 async def write_audit(
     db: AsyncSession,
-    *,
-    entity_type: str,
-    entity_id: str,
-    action: str,
-    actor_id: Optional[str] = None,
+    actor: Any = None,
+    entity_type: str = "",
+    entity_id: str = "",
+    action: str = "",
     before: Optional[dict] = None,
     after: Optional[dict] = None,
-    changed_fields: Optional[list[str]] = None,
     request: Optional[Request] = None,
-) -> AuditLog:
+    *,
+    actor_id: Optional[str] = None,
+    changed_fields: Optional[list[str]] = None,
+    note: Optional[str] = None,
+) -> Optional[AuditLog]:
+    """Best-effort audit row. Nested savepoint so failures never abort the main txn."""
+    if note:
+        after = dict(after or {})
+        after.setdefault("note", note)
+    if changed_fields is None and isinstance(after, dict) and isinstance(before, dict):
+        changed_fields = [k for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
+    elif changed_fields is None and isinstance(after, dict) and not before:
+        changed_fields = list(after.keys())
+
     ip = None
     ua = None
     if request is not None:
@@ -84,19 +109,29 @@ async def write_audit(
         ua = (request.headers.get("user-agent") or "")[:255] or None
 
     row = AuditLog(
-        actor_id=actor_id,
+        actor_id=_resolve_actor_id(actor, actor_id),
         entity_type=entity_type,
-        entity_id=entity_id,
-        action=action,
+        entity_id=str(entity_id) if entity_id is not None else "",
+        action=(action or "update")[:20],
         changed_fields=changed_fields or [],
         before=_jsonable(before) if before is not None else None,
         after=_jsonable(after) if after is not None else None,
         ip=ip,
         user_agent=ua,
     )
-    db.add(row)
-    await db.flush()
-    return row
+    try:
+        async with db.begin_nested():
+            db.add(row)
+            await db.flush()
+        return row
+    except Exception:
+        logger.exception(
+            "audit write failed entity=%s id=%s action=%s",
+            entity_type,
+            entity_id,
+            action,
+        )
+        return None
 
 
 async def audit_create(

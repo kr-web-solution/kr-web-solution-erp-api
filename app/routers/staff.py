@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, is_privileged, require_founder_ceo, require_staff
+from ..core.database import not_deleted
 from ..models import (
     Announcement,
     AttendanceDay,
@@ -590,7 +591,9 @@ async def create_task(
     if not await _can_manage_user(db, current_user, assignee_id):
         raise HTTPException(status_code=403, detail="Cannot assign tasks to this person")
     if payload.project_id:
-        proj = await db.execute(select(Project).where(Project.id == payload.project_id))
+        proj = await db.execute(
+            select(Project).where(Project.id == payload.project_id, not_deleted(Project))
+        )
         if not proj.scalars().first():
             raise HTTPException(status_code=400, detail="Project not found")
 
@@ -624,7 +627,7 @@ async def update_task(
     result = await db.execute(
         select(WorkTask)
         .options(selectinload(WorkTask.project), selectinload(WorkTask.assignee))
-        .where(WorkTask.id == task_id)
+        .where(WorkTask.id == task_id, not_deleted(WorkTask))
     )
     task = result.scalars().first()
     if not task:
@@ -638,6 +641,12 @@ async def update_task(
             raise HTTPException(status_code=400, detail="Invalid status")
         task.status = payload.status
     if payload.project_id is not None:
+        if payload.project_id:
+            proj = await db.execute(
+                select(Project).where(Project.id == payload.project_id, not_deleted(Project))
+            )
+            if not proj.scalars().first():
+                raise HTTPException(status_code=400, detail="Project not found")
         task.project_id = payload.project_id or None
     await db.flush()
     await db.refresh(task)

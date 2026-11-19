@@ -21,6 +21,20 @@ async def send_email_async(
     inline_images: Optional[Dict[str, bytes]] = None,
 ) -> bool:
     """Send email asynchronously using the SMTP configuration stored in settings."""
+    from .outbound import record, test_outbound_forced
+
+    if test_outbound_forced():
+        record(
+            "email",
+            to_email,
+            subject=subject,
+            cc=cc_email,
+            has_attachment=bool(attachment_bytes),
+            is_html=is_html,
+        )
+        logger.info("TEST outbound: recorded email to %s (SMTP not called)", to_email)
+        return True
+
     if not settings.smtp_host or not settings.smtp_from_email:
         raise ValueError("SMTP host and sender email must be configured in settings.")
 
