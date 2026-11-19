@@ -109,8 +109,14 @@ async def set_project_clients(
 
     await db.execute(delete(ProjectClient).where(ProjectClient.project_id == project.id))
     for cid in ids:
-        db.add(ProjectClient(project_id=project.id, client_id=cid))
-    project.client_id = primary
+        db.add(
+            ProjectClient(
+                project_id=project.id,
+                client_id=cid,
+                is_primary=(cid == primary),
+            )
+        )
+    project.client_id = primary  # kept in sync until column drop (F-005)
     await db.flush()
 
 
@@ -171,7 +177,13 @@ async def add_client_to_project(
     if existing:
         return project  # idempotent no-op
 
-    db.add(ProjectClient(project_id=project.id, client_id=cid))
+    db.add(
+        ProjectClient(
+            project_id=project.id,
+            client_id=cid,
+            is_primary=False if project.client_id else True,
+        )
+    )
     if not project.client_id:
         project.client_id = cid
     await db.flush()
@@ -218,7 +230,18 @@ async def remove_client_from_project(
     )
     if project.client_id == cid:
         remaining = [x for x in current_ids if x != cid]
-        project.client_id = remaining[0]
+        new_primary = remaining[0]
+        project.client_id = new_primary
+        await db.execute(
+            text(
+                """
+                UPDATE project_clients
+                SET is_primary = (client_id = :primary)
+                WHERE project_id = :project_id
+                """
+            ),
+            {"primary": new_primary, "project_id": project.id},
+        )
     await db.flush()
     return project
 

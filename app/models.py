@@ -3,7 +3,7 @@ from datetime import datetime, date, timezone
 from typing import Optional, List, Any
 from sqlalchemy import (
     String, Integer, BigInteger, Numeric, ForeignKey,
-    Text, Boolean, DateTime, Date, JSON, func, UniqueConstraint, Index, CheckConstraint
+    Text, Boolean, DateTime, Date, JSON, func, UniqueConstraint, Index, CheckConstraint, text
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .core.database import Base, SoftDeleteMixin, TimestampMixin
@@ -319,6 +319,15 @@ class ProjectClient(Base):
     """Many-to-many: project ↔ clients. A project must keep ≥1 client."""
 
     __tablename__ = "project_clients"
+    __table_args__ = (
+        # Exactly one primary per project (partial unique index created in migration 022)
+        Index(
+            "uq_project_clients_one_primary",
+            "project_id",
+            unique=True,
+            postgresql_where=text("is_primary = true"),
+        ),
+    )
 
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
@@ -326,6 +335,7 @@ class ProjectClient(Base):
     client_id: Mapped[str] = mapped_column(
         ForeignKey("clients.id", ondelete="RESTRICT"), primary_key=True, index=True
     )
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
