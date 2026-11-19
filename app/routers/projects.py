@@ -142,7 +142,7 @@ async def _load_project(db: AsyncSession, project_id: str, *extra_opts) -> Proje
         selectinload(Project.recurring_invoices),
         *extra_opts,
     ]
-    stmt = select(Project).options(*opts).where(Project.id == project_id)
+    stmt = select(Project).options(*opts).where(Project.id == project_id, not_deleted(Project))
     project = (await db.execute(stmt)).scalars().first()
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
@@ -227,29 +227,8 @@ async def get_project(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    stmt = (
-        select(Project)
-        .options(
-            selectinload(Project.client),
-            selectinload(Project.workers),
-            selectinload(Project.recurring_invoices)
-        )
-        .where(Project.id == project_id)
-    )
-    res = await db.execute(stmt)
-    project = res.scalars().first()
-
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-
-    if current_user.role == "worker":
-        worker_ids = [w.id for w in project.workers]
-        if current_user.id not in worker_ids:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    elif current_user.role == "client":
-        if project.client_id != current_user.client_id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-
+    project = await _load_project(db, project_id)
+    await _assert_project_access(project, current_user)
     return await _sanitize_project(db, project, current_user.role)
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -417,6 +396,7 @@ async def download_project_document(
             select(ProjectDocument).where(
                 ProjectDocument.id == doc_id,
                 ProjectDocument.project_id == project_id,
+                not_deleted(ProjectDocument),
             )
         )
     ).scalars().first()
@@ -438,11 +418,13 @@ async def delete_project_document(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo),
 ):
+    await _load_project(db, project_id)
     doc = (
         await db.execute(
             select(ProjectDocument).where(
                 ProjectDocument.id == doc_id,
                 ProjectDocument.project_id == project_id,
+                not_deleted(ProjectDocument),
             )
         )
     ).scalars().first()
@@ -460,19 +442,7 @@ async def toggle_project_maintenance(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = (
-        select(Project)
-        .options(
-            selectinload(Project.client),
-            selectinload(Project.workers),
-            selectinload(Project.recurring_invoices)
-        )
-        .where(Project.id == project_id)
-    )
-    res = await db.execute(stmt)
-    project = res.scalars().first()
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    project = await _load_project(db, project_id)
 
     if not project.recurring_invoices or len(project.recurring_invoices) == 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No recurring maintenance configured for this project")
@@ -677,19 +647,7 @@ async def update_project(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    stmt = (
-        select(Project)
-        .options(
-            selectinload(Project.client),
-            selectinload(Project.workers),
-            selectinload(Project.recurring_invoices),
-        )
-        .where(Project.id == project_id)
-    )
-    res = await db.execute(stmt)
-    project = res.scalars().first()
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    project = await _load_project(db, project_id)
 
     if current_user.role == "worker":
         worker_ids = [w.id for w in project.workers]
@@ -699,7 +657,7 @@ async def update_project(
         if payload.status:
             project.status = payload.status
         await db.commit()
-        await db.refresh(project)
+        project = await _load_project(db, project_id)
         return sanitize_project_for_role(project, current_user.role)
 
     elif current_user.role == "client":
@@ -974,9 +932,14 @@ async def delete_project_feature(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo),
 ):
+    await _load_project(db, project_id)
     feat = (
         await db.execute(
-            select(ProjectFeature).where(ProjectFeature.id == feature_id, ProjectFeature.project_id == project_id)
+            select(ProjectFeature).where(
+                ProjectFeature.id == feature_id,
+                ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeature),
+            )
         )
     ).scalars().first()
     if not feat:
@@ -998,9 +961,14 @@ async def create_feature_doc(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo),
 ):
+    await _load_project(db, project_id)
     feat = (
         await db.execute(
-            select(ProjectFeature).where(ProjectFeature.id == feature_id, ProjectFeature.project_id == project_id)
+            select(ProjectFeature).where(
+                ProjectFeature.id == feature_id,
+                ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeature),
+            )
         )
     ).scalars().first()
     if not feat:
@@ -1027,6 +995,7 @@ async def delete_feature_doc(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo),
 ):
+    await _load_project(db, project_id)
     doc = (
         await db.execute(
             select(ProjectFeatureDoc)
@@ -1035,6 +1004,7 @@ async def delete_feature_doc(
                 ProjectFeatureDoc.id == doc_id,
                 ProjectFeatureDoc.feature_id == feature_id,
                 ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeatureDoc),
             )
         )
     ).scalars().first()

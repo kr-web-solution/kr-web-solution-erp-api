@@ -25,6 +25,7 @@ from ..services.engagement_files import (
     save_upload,
 )
 from ..core.dependencies import get_current_user, get_db, require_founder_ceo, is_privileged
+from ..core.database import not_deleted
 from ..models import (
     Client,
     Engagement,
@@ -118,7 +119,7 @@ async def _load_engagement(db: AsyncSession, engagement_id: str) -> Engagement:
             selectinload(Engagement.owner),
             selectinload(Engagement.recurring_invoice).selectinload(RecurringInvoice.client),
         )
-        .where(Engagement.id == engagement_id)
+        .where(Engagement.id == engagement_id, not_deleted(Engagement))
     )
     eng = (await db.execute(stmt)).scalars().first()
     if not eng:
@@ -310,7 +311,7 @@ async def _ensure_project_internal(
             await db.execute(
                 select(Project)
                 .options(selectinload(Project.workers), selectinload(Project.recurring_invoices))
-                .where(Project.id == eng.project_id)
+                .where(Project.id == eng.project_id, not_deleted(Project))
             )
         ).scalars().first()
         if not project:
@@ -374,7 +375,7 @@ async def _ensure_project_internal(
             await db.execute(
                 select(Project)
                 .options(selectinload(Project.recurring_invoices))
-                .where(Project.id == project.id)
+                .where(Project.id == project.id, not_deleted(Project))
             )
         ).scalars().first()
         rec = await upsert_project_maintenance(
@@ -475,6 +476,7 @@ async def list_engagements(
             selectinload(Engagement.project),
             selectinload(Engagement.recurring_invoice),
         )
+        .where(not_deleted(Engagement))
         .order_by(Engagement.updated_at.desc())
     )
 
@@ -886,7 +888,7 @@ async def link_client(
 ):
     eng = await _load_engagement(db, engagement_id)
     if payload.client_id:
-        client = (await db.execute(select(Client).where(Client.id == payload.client_id))).scalars().first()
+        client = (await db.execute(select(Client).where(Client.id == payload.client_id, not_deleted(Client)))).scalars().first()
         if not client:
             raise HTTPException(status_code=404, detail="Client not found")
         eng.client_id = client.id
@@ -953,7 +955,7 @@ async def link_invoice(
     current_user: User = Depends(require_founder_ceo),
 ):
     eng = await _load_engagement(db, engagement_id)
-    inv = (await db.execute(select(Invoice).where(Invoice.id == payload.invoice_id))).scalars().first()
+    inv = (await db.execute(select(Invoice).where(Invoice.id == payload.invoice_id, not_deleted(Invoice)))).scalars().first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
     if payload.role == "advance":

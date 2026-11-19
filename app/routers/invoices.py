@@ -177,7 +177,7 @@ async def update_recurring_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = select(RecurringInvoice).options(selectinload(RecurringInvoice.client)).where(RecurringInvoice.id == recurring_id)
+    stmt = select(RecurringInvoice).options(selectinload(RecurringInvoice.client)).where(RecurringInvoice.id == recurring_id, not_deleted(RecurringInvoice))
     ref = (await db.execute(stmt)).scalars().first()
     if not ref:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurring invoice not found")
@@ -197,7 +197,7 @@ async def delete_recurring_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = select(RecurringInvoice).where(RecurringInvoice.id == recurring_id)
+    stmt = select(RecurringInvoice).where(RecurringInvoice.id == recurring_id, not_deleted(RecurringInvoice))
     ref = (await db.execute(stmt)).scalars().first()
     if not ref:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurring invoice not found")
@@ -217,7 +217,7 @@ async def get_invoice(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     res = await db.execute(stmt)
     inv = res.scalars().first()
@@ -334,7 +334,7 @@ async def cancel_invoice(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
@@ -366,7 +366,7 @@ async def create_credit_note(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     parent = (await db.execute(stmt)).scalars().first()
     if not parent:
@@ -470,7 +470,7 @@ async def update_invoice(
 ):
     from ..models import InvoiceAuditLog
 
-    stmt = select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id)
+    stmt = select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id, not_deleted(Invoice))
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
@@ -540,7 +540,7 @@ async def update_invoice(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     res = await db.execute(stmt)
     updated_inv = res.scalars().first()
@@ -576,7 +576,7 @@ async def download_invoice_pdf(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
@@ -615,7 +615,7 @@ async def send_invoice_email(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
@@ -709,7 +709,7 @@ async def mark_invoice_as_paid(
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
@@ -1011,7 +1011,7 @@ async def decide_late_fee_action(
     inv_stmt = (
         select(Invoice)
         .options(selectinload(Invoice.client), selectinload(Invoice.project))
-        .where(Invoice.id == invoice_id)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(inv_stmt)).scalars().first()
     if not inv:
