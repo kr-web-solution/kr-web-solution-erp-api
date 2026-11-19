@@ -4,11 +4,26 @@ Names only — never commit real secrets. Assumes Dokploy (or similar) builds th
 
 ## Required env var names
 
+### API (Dokploy API app)
+
 | Name | Notes |
 |------|--------|
 | `DATABASE_URL` | Async Postgres URL (`postgresql+asyncpg://…`) |
-| `SECRET_KEY` | JWT signing; refuse insecure/empty outside local |
-| `ENCRYPTION_KEY` | Fernet key for SMTP secrets |
+| `SECRET_KEY` | JWT signing; **must not** be a README/example placeholder — app refuses known insecure defaults in production. Generate: `openssl rand -hex 32` |
+| `ENCRYPTION_KEY` | Fernet key for SMTP secrets. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+
+### UI (Dokploy UI app)
+
+| Name | Notes |
+|------|--------|
+| `API_INTERNAL_URL` | **Required in production.** Docker DNS name of the API service + port `8000`, e.g. `http://<dokploy-api-service-name>:8000`. Never `127.0.0.1` / `localhost` (that is inside the UI container). |
+| `NEXT_PUBLIC_API_URL` | Leave empty so the browser calls same-origin `/api` (Next proxies). |
+
+### Shared / API continued
+
+| Name | Notes |
+|------|--------|
+| `SECRET_KEY` / `ENCRYPTION_KEY` | (see API table above) |
 | `ENVIRONMENT` | `production` for live; `development` / `local` / `test` for non-prod |
 | `PRODUCTION` | `true` on live |
 | `FRONTEND_URL` | UI origin |
