@@ -56,7 +56,9 @@ async def save_payment_proof(invoice_id: str, file: UploadFile) -> Tuple[str, st
             detail=f"Unsupported file type. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
-    content_type = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
+    from app.services.file_mime import resolve_media_type
+
+    content_type = resolve_media_type(file.content_type, original)
     if content_type not in ALLOWED_CONTENT_TYPES and ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Unsupported content type")
 
@@ -68,7 +70,6 @@ async def save_payment_proof(invoice_id: str, file: UploadFile) -> Tuple[str, st
         raise HTTPException(status_code=400, detail="File too large (max 10 MB)")
 
     stored = f"{uuid.uuid4().hex}{ext}"
-    content_type = content_type or "application/octet-stream"
     key = proof_object_key(invoice_id, stored)
     _put(key, data, content_type, local_dir=invoice_proof_dir(invoice_id), local_name=stored)
     return key, original, content_type, size

@@ -559,12 +559,15 @@ async def download_project_document(
     ).scalars().first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    from ..services.file_mime import inline_content_disposition, resolve_media_type
+
     data = read_stored(project_id, doc.stored_filename)
     filename = (doc.original_filename or "document").replace('"', "")
+    media = resolve_media_type(doc.content_type, doc.original_filename, doc.stored_filename)
     return Response(
         content=data,
-        media_type=doc.content_type or "application/octet-stream",
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        media_type=media,
+        headers={"Content-Disposition": inline_content_disposition(filename)},
     )
 
 

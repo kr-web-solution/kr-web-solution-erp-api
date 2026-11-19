@@ -32,7 +32,9 @@ async def save_project_upload(project_id: str, file: UploadFile) -> Tuple[str, s
             detail=f"Unsupported file type. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
-    content_type = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
+    from app.services.file_mime import resolve_media_type
+
+    content_type = resolve_media_type(file.content_type, original)
     if content_type not in ALLOWED_CONTENT_TYPES and ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Unsupported content type")
 
@@ -44,7 +46,6 @@ async def save_project_upload(project_id: str, file: UploadFile) -> Tuple[str, s
         raise HTTPException(status_code=400, detail="File too large (max 10 MB)")
 
     stored = f"{uuid.uuid4().hex}{ext}"
-    content_type = content_type or "application/octet-stream"
     from app.services.object_storage import put_bytes, storage_enabled
 
     if storage_enabled():

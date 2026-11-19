@@ -610,13 +610,20 @@ async def view_engagement_document(
     doc = next((d for d in (eng.documents or []) if d.id == doc_id), None)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    from ..services.file_mime import inline_content_disposition, resolve_media_type
+
     data = read_stored(eng.id, doc.stored_filename)
     filename = (doc.original_filename or "document").replace('"', "")
-    disposition = "attachment" if download else "inline"
+    media = resolve_media_type(doc.content_type, doc.original_filename, doc.stored_filename)
+    disposition = (
+        f'attachment; filename="{filename}"'
+        if download
+        else inline_content_disposition(filename)
+    )
     return Response(
         content=data,
-        media_type=doc.content_type or "application/octet-stream",
-        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+        media_type=media,
+        headers={"Content-Disposition": disposition},
     )
 
 

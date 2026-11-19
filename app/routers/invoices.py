@@ -1029,13 +1029,19 @@ async def download_payment_proof(
     if not inv.payment_proof_object_key:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No payment proof uploaded")
 
+    from ..services.file_mime import inline_content_disposition, resolve_media_type
+
     data = read_payment_proof(inv.payment_proof_object_key, inv.id)
     filename = inv.payment_proof_filename or "payment-proof"
-    media = inv.payment_proof_content_type or "application/octet-stream"
+    media = resolve_media_type(
+        inv.payment_proof_content_type,
+        inv.payment_proof_filename,
+        inv.payment_proof_object_key,
+    )
     return Response(
         content=data,
         media_type=media,
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        headers={"Content-Disposition": inline_content_disposition(filename)},
     )
 
 
