@@ -8,7 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select, text, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
-from ..core.database import AsyncSessionLocal, engine
+from ..core.database import AsyncSessionLocal, engine, not_deleted
 from ..models import RecurringInvoice, Invoice, InvoiceItem, Settings, User, LateFeeAction
 from .pdf import generate_invoice_pdf
 from .email import send_email_async
@@ -46,6 +46,7 @@ async def step_a_generate_recurring_invoices(today: date) -> List[str]:
             select(RecurringInvoice)
             .options(selectinload(RecurringInvoice.client), selectinload(RecurringInvoice.project))
             .where(
+                not_deleted(RecurringInvoice),
                 RecurringInvoice.active == True,
                 RecurringInvoice.starts_on <= today,
                 or_(RecurringInvoice.ends_on.is_(None), RecurringInvoice.ends_on >= today),

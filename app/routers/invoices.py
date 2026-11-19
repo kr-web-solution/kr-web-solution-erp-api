@@ -36,7 +36,12 @@ router = APIRouter(prefix="/invoices", tags=["Invoices"])
 async def _hold_maintenance_emails(db: AsyncSession, project_id: str, covers_to: date) -> None:
     """Push the next automatic maintenance email to the day after this coverage."""
     rec = (
-        await db.execute(select(RecurringInvoice).where(RecurringInvoice.project_id == project_id))
+        await db.execute(
+            select(RecurringInvoice).where(
+                RecurringInvoice.project_id == project_id,
+                not_deleted(RecurringInvoice),
+            )
+        )
     ).scalars().first()
     if not rec:
         return
@@ -165,7 +170,11 @@ async def list_recurring_invoices(
 ):
     stmt = (
         select(RecurringInvoice)
-        .options(selectinload(RecurringInvoice.client))
+        .options(
+            selectinload(RecurringInvoice.client),
+            selectinload(RecurringInvoice.project),
+        )
+        .where(not_deleted(RecurringInvoice))
         .order_by(RecurringInvoice.created_at.desc())
     )
     res = await db.execute(stmt)
@@ -175,6 +184,7 @@ async def list_recurring_invoices(
     for r in recs:
         resp = RecurringInvoiceResponse.model_validate(r)
         resp.client_name = r.client.name if r.client else None
+        resp.project_name = r.project.name if r.project else None
         output.append(resp)
     return output
 
@@ -248,7 +258,8 @@ async def delete_recurring_invoice(
     ref = (await db.execute(stmt)).scalars().first()
     if not ref:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurring invoice not found")
-    await db.delete(ref)
+    ref.active = False
+    ref.soft_delete()
     await db.commit()
     return {"message": "Recurring invoice schedule deleted successfully"}
 
