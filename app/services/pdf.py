@@ -1,5 +1,7 @@
 import io
+from pathlib import Path
 from typing import Optional
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import inch
@@ -8,10 +10,81 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+from reportlab.lib.utils import ImageReader
+
+_ASSETS = Path(__file__).resolve().parents[1] / "assets"
+_LOGO_CANDIDATES = [
+    _ASSETS / "krws-mark.png",
+    _ASSETS / "kr-logo.png",
+]
+
 
 def format_inr(paise: int) -> str:
     rupees = paise / 100.0
     return f"Rs. {rupees:,.2f}"
+
+
+def _logo_path() -> Optional[Path]:
+    for p in _LOGO_CANDIDATES:
+        if p.is_file():
+            return p
+    return None
+
+
+def _status_stamp_style(status: str) -> Optional[tuple[str, str]]:
+    s = (status or "").lower()
+    mapping = {
+        "paid": ("PAID", "#16A34A"),
+        "draft": ("DRAFT", "#64748B"),
+        "overdue": ("OVERDUE", "#B91C1C"),
+        "proof_pending": ("PROOF SUBMITTED", "#A16207"),
+        "cancelled": ("CANCELLED", "#64748B"),
+        "void": ("VOID", "#64748B"),
+        "sent": ("SENT", "#2563EB"),
+    }
+    return mapping.get(s)
+
+
+def _draw_invoice_chrome(canvas, _doc, *, status: str):
+    """Logo watermark + diagonal status stamp on every page."""
+    canvas.saveState()
+    page_w, page_h = A4
+    logo = _logo_path()
+    if logo is not None:
+        try:
+            img = ImageReader(str(logo))
+            size = 260
+            canvas.setFillAlpha(0.06)
+            canvas.drawImage(
+                img,
+                (page_w - size) / 2.0,
+                (page_h - size) / 2.0,
+                width=size,
+                height=size,
+                mask="auto",
+                preserveAspectRatio=True,
+            )
+            canvas.setFillAlpha(1.0)
+        except Exception:
+            pass
+
+    stamp = _status_stamp_style(status)
+    if stamp:
+        label, hex_color = stamp
+        canvas.translate(page_w / 2, page_h / 2)
+        canvas.rotate(28)
+        canvas.setStrokeColor(colors.HexColor(hex_color))
+        canvas.setFillColor(colors.HexColor(hex_color))
+        canvas.setLineWidth(2.2)
+        canvas.setFont("Helvetica-Bold", 36 if len(label) <= 10 else 26)
+        canvas.setFillAlpha(0.18)
+        canvas.setStrokeAlpha(0.35)
+        tw = canvas.stringWidth(label, "Helvetica-Bold", 36 if len(label) <= 10 else 26)
+        pad_x, pad_y = 18, 12
+        canvas.roundRect(-tw / 2 - pad_x, -22, tw + pad_x * 2, 44, 8, stroke=1, fill=0)
+        canvas.drawCentredString(0, -8, label)
+    canvas.restoreState()
+
 
 def generate_invoice_pdf(
     invoice,
@@ -22,6 +95,11 @@ def generate_invoice_pdf(
     parent_invoice=None
 ) -> bytes:
     buffer = io.BytesIO()
+    status = getattr(invoice, "status", "") or ""
+
+    def _on_page(canvas, doc_):
+        _draw_invoice_chrome(canvas, doc_, status=status)
+
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
@@ -349,7 +427,7 @@ def generate_invoice_pdf(
     )
     elements.append(footer_text)
 
-    doc.build(elements)
+    doc.build(elements, onFirstPage=_on_page, onLaterPages=_on_page)
     buffer.seek(0)
     return buffer.getvalue()
 
