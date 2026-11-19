@@ -1,5 +1,29 @@
+from __future__ import annotations
+
 from typing import List, Optional
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Documented insecure placeholders — never allowed outside local/development.
+_INSECURE_SECRET_DEFAULTS = frozenset(
+    {
+        "5678402f1e2851e0d04db3f7f6117e188360cb31c07262cf4f6722eeaa0510d7",
+        "change-this-to-a-very-secure-random-secret-key-32-chars-min",
+        "changeme",
+        "secret",
+        "dev-secret",
+    }
+)
+_INSECURE_ENCRYPTION_DEFAULTS = frozenset(
+    {
+        "Qlhs7DPpurqcfoT6JENui-kFxgVjkywqzwC-iEFcWwE=",
+        "32-character-base64-key-for-encrypting-smtp-passwords==",
+    }
+)
+_LOCAL_ENVS = frozenset({"local", "development", "dev", "test"})
+_MIN_SECRET_LEN = 32
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -14,12 +38,12 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     PRODUCTION: bool = False
 
-    # Security & JWT
-    SECRET_KEY: str = "5678402f1e2851e0d04db3f7f6117e188360cb31c07262cf4f6722eeaa0510d7"
+    # Security & JWT — no usable hardcoded secrets; set via environment.
+    SECRET_KEY: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     ALGORITHM: str = "HS256"
     COOKIE_NAME: str = "kr_access_token"
-    ENCRYPTION_KEY: str = "Qlhs7DPpurqcfoT6JENui-kFxgVjkywqzwC-iEFcWwE="
+    ENCRYPTION_KEY: str = ""
 
     # Bootstrap super admin (created only when users table is empty)
     SUPER_ADMIN_EMAIL: Optional[str] = None
@@ -72,6 +96,12 @@ class Settings(BaseSettings):
     MICROSOFT_CLIENT_SECRET: Optional[str] = None
 
     @property
+    def is_local_environment(self) -> bool:
+        if self.PRODUCTION:
+            return False
+        return (self.ENVIRONMENT or "").strip().lower() in _LOCAL_ENVS
+
+    @property
     def bootstrap_admin_email(self) -> Optional[str]:
         return self.SUPER_ADMIN_EMAIL or self.FIRST_SUPERUSER_EMAIL
 
@@ -86,6 +116,81 @@ class Settings(BaseSettings):
             or self.FIRST_SUPERUSER_NAME
             or "KR WEB SOLUTION ADMIN"
         )
+
+    @model_validator(mode="after")
+    def validate_security_keys(self) -> "Settings":
+        """Refuse insecure or missing keys outside local/dev/test."""
+        errors = validate_security_keys(
+            secret_key=self.SECRET_KEY,
+            encryption_key=self.ENCRYPTION_KEY,
+            environment=self.ENVIRONMENT,
+            production=self.PRODUCTION,
+        )
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
+
+
+def validate_security_keys(
+    *,
+    secret_key: str,
+    encryption_key: str,
+    environment: str,
+    production: bool,
+) -> list[str]:
+    """
+    Return human-readable problems (variable names only — never key values).
+
+    Local/dev/test may start with empty keys only if you set them in .env;
+    we still reject known insecure published defaults everywhere.
+    Non-local environments always require strong keys.
+    """
+    env = (environment or "").strip().lower()
+    is_local = (not production) and env in _LOCAL_ENVS
+    errors: list[str] = []
+
+    secret = (secret_key or "").strip()
+    enc = (encryption_key or "").strip()
+
+    if secret in _INSECURE_SECRET_DEFAULTS:
+        errors.append(
+            "SECRET_KEY is set to a known insecure default; generate a new one "
+            "(openssl rand -hex 32)"
+        )
+    elif not secret:
+        if not is_local:
+            errors.append(
+                "SECRET_KEY is missing; set a strong value "
+                "(openssl rand -hex 32) before starting in this environment"
+            )
+    elif len(secret) < _MIN_SECRET_LEN:
+        errors.append(
+            f"SECRET_KEY is too short (minimum {_MIN_SECRET_LEN} characters)"
+        )
+
+    if enc in _INSECURE_ENCRYPTION_DEFAULTS:
+        errors.append(
+            "ENCRYPTION_KEY is set to a known insecure default; generate a Fernet key "
+            "(python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\")"
+        )
+    elif not enc:
+        if not is_local:
+            errors.append(
+                "ENCRYPTION_KEY is missing; set a Fernet key before starting in this environment"
+            )
+    else:
+        # Validate Fernet format when provided
+        try:
+            from cryptography.fernet import Fernet
+
+            Fernet(enc.encode("utf-8"))
+        except Exception:
+            errors.append(
+                "ENCRYPTION_KEY is not a valid Fernet key "
+                "(python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\")"
+            )
+
+    return errors
 
 
 settings = Settings()

@@ -132,6 +132,12 @@ MICROSOFT_CLIENT_SECRET=
 
 # CORS Allowed Origins
 BACKEND_CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000"]
+
+# JWT / encryption (required outside local/dev — never commit real values)
+# SECRET_KEY: openssl rand -hex 32
+# ENCRYPTION_KEY: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Rotating SECRET_KEY invalidates all sessions and invite/reset tokens.
+# Rotating ENCRYPTION_KEY breaks decryption of stored SMTP passwords — re-save them in Settings.
 ```
 
 **Bootstrap login**: when the `users` table has no active rows, seed creates one `admin` from `SUPER_ADMIN_*`. There are **no** dummy seeded logins. Additional people are invited from Settings → People (set-password email). Staff emails must be `@krwebsolution.com`; client/lead emails must not use that domain.

@@ -1,4 +1,3 @@
-import base64
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 import bcrypt
@@ -94,12 +93,12 @@ def unusable_password_hash() -> str:
 
 # Fernet encryption for SMTP password at rest
 def _get_fernet() -> Fernet:
-    try:
-        return Fernet(settings.ENCRYPTION_KEY.encode('utf-8'))
-    except Exception:
-        # Fallback to key derived from SECRET_KEY if invalid
-        key = base64.urlsafe_b64encode(settings.SECRET_KEY[:32].encode('utf-8'))
-        return Fernet(key)
+    key = (settings.ENCRYPTION_KEY or "").strip()
+    if not key:
+        raise RuntimeError(
+            "ENCRYPTION_KEY is not configured; cannot encrypt/decrypt secrets"
+        )
+    return Fernet(key.encode("utf-8"))
 
 def encrypt_secret(plain_text: str) -> str:
     if not plain_text:
