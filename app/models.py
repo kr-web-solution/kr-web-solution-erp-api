@@ -817,6 +817,13 @@ class Settings(SoftDeleteMixin, Base):
     company_address: Mapped[Optional[str]] = mapped_column(Text, default="Salem, Tamil Nadu, India", nullable=True)
     company_gstin: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     company_logo_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    company_phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    company_website: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    company_tagline: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        default="Web Development | Cloud | Software Solutions",
+        nullable=True,
+    )
     # Company code used in invoice numbers, e.g. KRWS → KRWS-DEV-2026-001
     invoice_prefix: Mapped[str] = mapped_column(String(32), default="KRWS", nullable=False)
     invoice_next_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)

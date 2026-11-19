@@ -484,8 +484,19 @@ class InvoiceResponse(OrmBase):
     ledger: str = "development"  # development | maintenance | mixed
     client_id: str
     client_name: Optional[str] = None
+    # Bill-to snapshot fields for document preview (from linked client)
+    client_attn: Optional[str] = None
+    client_designation: Optional[str] = None
+    client_email: Optional[str] = None
+    client_phone: Optional[str] = None
+    client_address: Optional[str] = None
+    client_city: Optional[str] = None
+    client_state: Optional[str] = None
+    client_pincode: Optional[str] = None
+    client_gstin: Optional[str] = None
     project_id: Optional[str] = None
     project_name: Optional[str] = None
+    project_ref: Optional[str] = None
     status: str  # "draft", "sent", "paid", "overdue", "cancelled"
     issue_date: date
     due_date: date
@@ -499,6 +510,7 @@ class InvoiceResponse(OrmBase):
     paid_at: Optional[datetime] = None
     period_key: Optional[str] = None
     parent_invoice_id: Optional[str] = None
+    parent_invoice_number: Optional[str] = None
     reminder_count: int = 0
     last_reminder_at: Optional[datetime] = None
     overdue_notified_at: Optional[datetime] = None
@@ -528,6 +540,16 @@ class InvoiceResponse(OrmBase):
     payment_bank_ifsc: Optional[str] = None
     payment_bank_upi_details: Optional[str] = None
     gst_enabled: bool = False
+    # Company document header snapshot (from settings)
+    company_name: Optional[str] = None
+    company_address: Optional[str] = None
+    company_gstin: Optional[str] = None
+    company_email: Optional[str] = None
+    company_phone: Optional[str] = None
+    company_website: Optional[str] = None
+    company_tagline: Optional[str] = None
+    company_logo_url: Optional[str] = None
+    payment_terms: Optional[str] = None
 
 # ----------------- Recurring Invoices -----------------
 class RecurringInvoiceCreate(BaseModel):
@@ -644,6 +666,9 @@ class SettingsResponse(OrmBase):
     company_address: Optional[str] = None
     company_gstin: Optional[str] = None
     company_logo_url: Optional[str] = None
+    company_phone: Optional[str] = None
+    company_website: Optional[str] = None
+    company_tagline: Optional[str] = None
     invoice_prefix: str
     invoice_next_number: int
     invoice_sequences: dict = {}
@@ -678,6 +703,9 @@ class SettingsUpdate(BaseModel):
     company_address: Optional[str] = None
     company_gstin: Optional[str] = None
     company_logo_url: Optional[str] = None
+    company_phone: Optional[str] = None
+    company_website: Optional[str] = None
+    company_tagline: Optional[str] = None
     invoice_prefix: Optional[str] = None
     invoice_next_number: Optional[int] = None
     invoice_sequences: Optional[dict] = None

@@ -2,7 +2,7 @@ from datetime import date, datetime, timezone, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, inspect as sa_inspect
 from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
@@ -58,6 +58,28 @@ async def _load_settings(db: AsyncSession) -> Optional[Settings]:
     return (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
 
 
+def _invoice_eager_options(*, include_parent: bool = False):
+    opts = [
+        selectinload(Invoice.client),
+        selectinload(Invoice.project),
+        selectinload(Invoice.items),
+    ]
+    if include_parent:
+        opts.append(selectinload(Invoice.parent_invoice))
+    return opts
+
+
+def _loaded_parent_invoice(inv: Invoice) -> Optional[Invoice]:
+    """Return parent only when already eager-loaded (safe under async)."""
+    try:
+        unloaded = sa_inspect(inv).unloaded
+    except Exception:
+        return None
+    if "parent_invoice" in unloaded:
+        return None
+    return getattr(inv, "parent_invoice", None)
+
+
 def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -> InvoiceResponse:
     # Query-time overdue calculation
     effective_status = inv.status
@@ -66,15 +88,40 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
 
     pay = resolve_payment_upi(settings, inv) if settings else {"upi_id": None, "upi_qr_url": None}
 
+    client = inv.client
+    project = inv.project
+    parent = _loaded_parent_invoice(inv)
+    project_ref = None
+    if project and getattr(project, "id", None):
+        project_ref = str(project.id).replace("prj_", "PRJ-").upper()
+
     resp = InvoiceResponse(
         id=inv.id,
         invoice_number=inv.invoice_number,
         invoice_type=inv.invoice_type,
         ledger=getattr(inv, "ledger", None) or "development",
         client_id=inv.client_id,
-        client_name=inv.client.name if inv.client else None,
+        client_name=client.name if client else None,
+        client_attn=getattr(client, "primary_contact_name", None) if client else None,
+        client_designation=getattr(client, "designation", None) if client else None,
+        client_email=(
+            (getattr(client, "contact_email", None) or getattr(client, "email", None))
+            if client
+            else None
+        ),
+        client_phone=(
+            (getattr(client, "contact_phone", None) or getattr(client, "phone", None))
+            if client
+            else None
+        ),
+        client_address=getattr(client, "address", None) if client else None,
+        client_city=getattr(client, "city", None) if client else None,
+        client_state=getattr(client, "state", None) if client else None,
+        client_pincode=getattr(client, "pincode", None) if client else None,
+        client_gstin=getattr(client, "gstin", None) if client else None,
         project_id=inv.project_id,
-        project_name=inv.project.name if inv.project else None,
+        project_name=project.name if project else None,
+        project_ref=project_ref,
         status=effective_status,
         issue_date=inv.issue_date,
         due_date=inv.due_date,
@@ -88,6 +135,7 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
         paid_at=inv.paid_at,
         period_key=inv.period_key,
         parent_invoice_id=inv.parent_invoice_id,
+        parent_invoice_number=getattr(parent, "invoice_number", None) if parent else None,
         reminder_count=inv.reminder_count,
         last_reminder_at=inv.last_reminder_at,
         overdue_notified_at=inv.overdue_notified_at,
@@ -115,6 +163,19 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
         payment_bank_ifsc=getattr(settings, "bank_ifsc", None) if settings else None,
         payment_bank_upi_details=getattr(settings, "bank_upi_details", None) if settings else None,
         gst_enabled=gst_is_enabled(settings) if settings else False,
+        company_name=getattr(settings, "company_name", None) if settings else None,
+        company_address=getattr(settings, "company_address", None) if settings else None,
+        company_gstin=(
+            getattr(settings, "company_gstin", None)
+            if settings and gst_is_enabled(settings)
+            else None
+        ),
+        company_email=getattr(settings, "smtp_from_email", None) if settings else None,
+        company_phone=getattr(settings, "company_phone", None) if settings else None,
+        company_website=getattr(settings, "company_website", None) if settings else None,
+        company_tagline=getattr(settings, "company_tagline", None) if settings else None,
+        company_logo_url=getattr(settings, "company_logo_url", None) if settings else None,
+        payment_terms=getattr(settings, "payment_terms", None) if settings else None,
     )
     return resp
 
@@ -131,6 +192,7 @@ async def _send_paid_receipt_email(db: AsyncSession, inv: Invoice, st: Optional[
         settings=st,
         items=inv.items,
         project=inv.project,
+        parent_invoice=_loaded_parent_invoice(inv),
     )
     from ..services.email_html import compose_invoice_client_email
 
@@ -333,7 +395,7 @@ async def get_invoice(
 ):
     stmt = (
         select(Invoice)
-        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .options(*_invoice_eager_options(include_parent=True))
         .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     res = await db.execute(stmt)
@@ -752,7 +814,7 @@ async def download_invoice_pdf(
 ):
     stmt = (
         select(Invoice)
-        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .options(*_invoice_eager_options(include_parent=True))
         .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
@@ -769,7 +831,8 @@ async def download_invoice_pdf(
         client=inv.client,
         settings=settings_obj,
         items=inv.items,
-        project=inv.project
+        project=inv.project,
+        parent_invoice=_loaded_parent_invoice(inv),
     )
 
     filename = f"{inv.invoice_number}.pdf"
@@ -790,7 +853,7 @@ async def send_invoice_email(
 ):
     stmt = (
         select(Invoice)
-        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .options(*_invoice_eager_options(include_parent=True))
         .where(Invoice.id == invoice_id, not_deleted(Invoice))
     )
     inv = (await db.execute(stmt)).scalars().first()
@@ -806,13 +869,13 @@ async def send_invoice_email(
     if not st or not st.smtp_host:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="SMTP is not configured in settings")
 
-    # Generate PDF (paid invoices get the PAID stamp from pdf renderer)
     pdf_bytes = generate_invoice_pdf(
         invoice=inv,
         client=inv.client,
         settings=st,
         items=inv.items,
-        project=inv.project
+        project=inv.project,
+        parent_invoice=_loaded_parent_invoice(inv),
     )
 
     from ..services.email_html import compose_invoice_client_email
