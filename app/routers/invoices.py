@@ -159,10 +159,26 @@ async def create_recurring_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    rec = RecurringInvoice(**payload.model_dump())
-    db.add(rec)
+    from ..services.client_project import create_maintenance_plan
+
+    rec = await create_maintenance_plan(
+        db,
+        project_id=payload.project_id,
+        client_id=payload.client_id,
+        amount_paise=payload.amount_paise,
+        send_day=payload.send_day,
+        due_after_days=payload.due_after_days,
+        reminder_every_days=payload.reminder_every_days,
+        starts_on=payload.starts_on,
+        ends_on=payload.ends_on,
+        line_items_template=payload.line_items_template,
+        tax_rate_percent=payload.tax_rate_percent,
+        day_of_month=payload.day_of_month,
+        next_run_date=payload.next_run_date,
+        active=payload.active,
+        notes=payload.notes,
+    )
     await db.commit()
-    await db.refresh(rec)
 
     stmt = select(RecurringInvoice).options(selectinload(RecurringInvoice.client)).where(RecurringInvoice.id == rec.id)
     ref = (await db.execute(stmt)).scalars().first()
@@ -177,7 +193,11 @@ async def update_recurring_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = select(RecurringInvoice).options(selectinload(RecurringInvoice.client)).where(RecurringInvoice.id == recurring_id, not_deleted(RecurringInvoice))
+    stmt = (
+        select(RecurringInvoice)
+        .options(selectinload(RecurringInvoice.client))
+        .where(RecurringInvoice.id == recurring_id, not_deleted(RecurringInvoice))
+    )
     ref = (await db.execute(stmt)).scalars().first()
     if not ref:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurring invoice not found")
@@ -197,7 +217,9 @@ async def delete_recurring_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    stmt = select(RecurringInvoice).where(RecurringInvoice.id == recurring_id, not_deleted(RecurringInvoice))
+    stmt = select(RecurringInvoice).where(
+        RecurringInvoice.id == recurring_id, not_deleted(RecurringInvoice)
+    )
     ref = (await db.execute(stmt)).scalars().first()
     if not ref:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurring invoice not found")
@@ -238,11 +260,12 @@ async def create_invoice(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    # Verify client exists
-    c_res = await db.execute(select(Client).where(Client.id == payload.client_id))
-    client = c_res.scalars().first()
-    if not client:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client not found")
+    from ..services.client_project import create_invoice_guards, assert_clients_exist
+
+    await assert_clients_exist(db, [payload.client_id])
+    await create_invoice_guards(
+        db, project_id=payload.project_id, client_id=payload.client_id
+    )
 
     # ATOMIC SEQUENCE INCREMENT with SELECT ... FOR UPDATE
     settings_stmt = select(Settings).where(Settings.id == "default").with_for_update()

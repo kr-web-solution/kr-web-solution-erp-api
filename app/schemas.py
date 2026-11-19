@@ -1,6 +1,6 @@
 from datetime import datetime, date
 from typing import Optional, List, Any
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 # ----------------- Base Config -----------------
 class OrmBase(BaseModel):
@@ -221,9 +221,19 @@ class MaintenanceBillingCreate(BaseModel):
     ends_on: Optional[date] = None
     notes: Optional[str] = None
 
+class ProjectClientBrief(BaseModel):
+    id: str
+    name: str
+    is_primary: bool = False
+
+class ProjectClientAdd(BaseModel):
+    client_id: str
+
 class ProjectBase(BaseModel):
     name: str
-    client_id: str
+    # Legacy single client (still accepted). Prefer client_ids for multi-client.
+    client_id: Optional[str] = None
+    client_ids: List[str] = Field(default_factory=list)
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
@@ -231,13 +241,28 @@ class ProjectBase(BaseModel):
     status: str = "running"  # "lead", "running", "on_hold", "stopped", "completed"
 
 class ProjectCreate(ProjectBase):
+    client_ids: List[str] = Field(min_length=1)
     worker_ids: Optional[List[str]] = []
     development_days: Optional[int] = Field(None, ge=1)
     maintenance: Optional[MaintenanceBillingCreate] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def coalesce_legacy_client_id(cls, data: Any) -> Any:
+        """Accept legacy client_id-only payloads by folding into client_ids."""
+        if not isinstance(data, dict):
+            return data
+        ids = [x for x in (data.get("client_ids") or []) if x]
+        legacy = data.get("client_id")
+        if legacy and legacy not in ids:
+            ids = [legacy] + ids
+        data = {**data, "client_ids": ids}
+        return data
+
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
-    client_id: Optional[str] = None
+    client_id: Optional[str] = None  # set primary client (must already be linked, or use client_ids)
+    client_ids: Optional[List[str]] = None  # replace full membership (≥1)
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
@@ -251,8 +276,10 @@ class ProjectUpdate(BaseModel):
 class ProjectResponse(OrmBase):
     id: str
     name: str
-    client_id: str
+    client_id: str  # primary / billing client
     client_name: Optional[str] = None
+    client_ids: List[str] = []
+    clients: List[ProjectClientBrief] = []
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
@@ -392,7 +419,7 @@ class InvoiceItemResponse(InvoiceItemBase, OrmBase):
 class InvoiceCreate(BaseModel):
     invoice_type: str = "custom_dev"
     client_id: str
-    project_id: Optional[str] = None
+    project_id: str
     issue_date: date
     due_date: date
     tax_rate_percent: float = 0.0
@@ -472,8 +499,9 @@ class InvoiceResponse(OrmBase):
 
 # ----------------- Recurring Invoices -----------------
 class RecurringInvoiceCreate(BaseModel):
+    """Maintenance plan create — project_id is required."""
     client_id: str
-    project_id: Optional[str] = None
+    project_id: str
     amount_paise: int = 0
     send_day: int = Field(ge=1, le=28, default=1)
     due_after_days: int = Field(ge=1, default=5)
@@ -486,6 +514,10 @@ class RecurringInvoiceCreate(BaseModel):
     next_run_date: date
     active: bool = True
     notes: Optional[str] = None
+
+
+# Domain alias used in docs / newer callers
+MaintenancePlanCreate = RecurringInvoiceCreate
 
 class RecurringInvoiceUpdate(BaseModel):
     client_id: Optional[str] = None

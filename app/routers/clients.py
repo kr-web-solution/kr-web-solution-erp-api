@@ -6,11 +6,25 @@ from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo
 from ..core.database import not_deleted
-from ..models import Client, Project, Invoice, User
+from ..models import Client, Project, ProjectClient, Invoice, User
 from ..schemas import ClientResponse, ClientCreate, ClientUpdate
 from ..services.audit import audit_create, audit_soft_delete, audit_update, snapshot_entity
+from ..services.client_project import delete_client as delete_client_record
 
 router = APIRouter(prefix="/clients", tags=["Clients"])
+
+
+async def _projects_count_for_client(db: AsyncSession, client_id: str) -> int:
+    return (
+        await db.scalar(
+            select(func.count())
+            .select_from(ProjectClient)
+            .join(Project, Project.id == ProjectClient.project_id)
+            .where(ProjectClient.client_id == client_id, not_deleted(Project))
+        )
+        or 0
+    )
+
 
 _BLANK_TO_NONE = (
     "primary_contact_name",
@@ -51,7 +65,8 @@ async def list_clients(
         # Workers see clients of projects assigned to them
         stmt = (
             select(Client)
-            .join(Project, Project.client_id == Client.id)
+            .join(ProjectClient, ProjectClient.client_id == Client.id)
+            .join(Project, Project.id == ProjectClient.project_id)
             .join(Project.workers)
             .where(User.id == current_user.id, not_deleted(Client), not_deleted(Project))
             .distinct()
@@ -66,14 +81,12 @@ async def list_clients(
     # Calculate counts
     response_list = []
     for cl in clients:
-        p_cnt = await db.scalar(
-            select(func.count()).select_from(Project).where(Project.client_id == cl.id, not_deleted(Project))
-        )
+        p_cnt = await _projects_count_for_client(db, cl.id)
         i_cnt = await db.scalar(
             select(func.count()).select_from(Invoice).where(Invoice.client_id == cl.id, not_deleted(Invoice))
         )
         resp = ClientResponse.model_validate(cl)
-        resp.projects_count = p_cnt or 0
+        resp.projects_count = p_cnt
         resp.invoices_count = i_cnt or 0
         response_list.append(resp)
 
@@ -93,14 +106,12 @@ async def get_client(
     if not client:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 
-    p_cnt = await db.scalar(
-        select(func.count()).select_from(Project).where(Project.client_id == client.id, not_deleted(Project))
-    )
+    p_cnt = await _projects_count_for_client(db, client.id)
     i_cnt = await db.scalar(
         select(func.count()).select_from(Invoice).where(Invoice.client_id == client.id, not_deleted(Invoice))
     )
     resp = ClientResponse.model_validate(client)
-    resp.projects_count = p_cnt or 0
+    resp.projects_count = p_cnt
     resp.invoices_count = i_cnt or 0
     return resp
 
@@ -143,14 +154,12 @@ async def update_client(
     await db.commit()
     await db.refresh(client)
 
-    p_cnt = await db.scalar(
-        select(func.count()).select_from(Project).where(Project.client_id == client.id, not_deleted(Project))
-    )
+    p_cnt = await _projects_count_for_client(db, client.id)
     i_cnt = await db.scalar(
         select(func.count()).select_from(Invoice).where(Invoice.client_id == client.id, not_deleted(Invoice))
     )
     resp = ClientResponse.model_validate(client)
-    resp.projects_count = p_cnt or 0
+    resp.projects_count = p_cnt
     resp.invoices_count = i_cnt or 0
     return resp
 
@@ -161,12 +170,7 @@ async def delete_client(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Client).where(Client.id == client_id, not_deleted(Client)))
-    client = res.scalars().first()
-    if not client:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
-
-    client.soft_delete()
+    client = await delete_client_record(db, client_id)
     await audit_soft_delete(db, client, actor_id=current_user.id, request=request)
     await db.commit()
     return {"message": "Client deleted successfully"}

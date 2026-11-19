@@ -8,7 +8,6 @@ from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
 from ..core.database import not_deleted
-from ..services.project_visibility import projects_visible_to_client
 from ..common.workflow import DELIVERY_MAX_STAGE, DELIVERY_MIN_STAGE, WARRANTY_DEFAULT_DAYS
 from ..models import (
     Project,
@@ -26,6 +25,8 @@ from ..schemas import (
     ProjectResponse,
     ProjectCreate,
     ProjectUpdate,
+    ProjectClientAdd,
+    ProjectClientBrief,
     ProjectProrataResponse,
     ProjectGoLiveRequest,
     ProjectInvoiceCreateResponse,
@@ -39,6 +40,15 @@ from ..schemas import (
     ProjectFeatureDocResponse,
     ProjectDocumentResponse,
 )
+from ..services.client_project import (
+    add_client_to_project,
+    create_project as create_project_record,
+    delete_project as delete_project_record,
+    project_has_client,
+    remove_client_from_project,
+    set_project_clients,
+)
+from ..services.project_visibility import projects_visible_to_client
 from ..models import Invoice
 from ..services.project_delivery import (
     checklist_progress,
@@ -71,7 +81,21 @@ def sanitize_project_for_role(
     invoiced_paise: Optional[int] = None,
 ) -> ProjectResponse:
     resp = ProjectResponse.model_validate(project)
-    resp.client_name = project.client.name if project.client else None
+    linked = list(getattr(project, "clients", None) or [])
+    if not linked and project.client:
+        linked = [project.client]
+    resp.clients = [
+        ProjectClientBrief(
+            id=c.id,
+            name=c.name,
+            is_primary=(c.id == project.client_id),
+        )
+        for c in linked
+    ]
+    resp.client_ids = [c.id for c in linked] or ([project.client_id] if project.client_id else [])
+    resp.client_name = project.client.name if project.client else (
+        linked[0].name if linked else None
+    )
     resp.workers = [UserResponse.model_validate(w) for w in project.workers]
     resp.delivery_phase = getattr(project, "delivery_phase", None) or 5
     resp.delivery_phase_name = phase_name(resp.delivery_phase)
@@ -139,11 +163,16 @@ async def _sanitize_project(
 async def _load_project(db: AsyncSession, project_id: str, *extra_opts) -> Project:
     opts = [
         selectinload(Project.client),
+        selectinload(Project.clients),
         selectinload(Project.workers),
         selectinload(Project.recurring_invoices),
         *extra_opts,
     ]
-    stmt = select(Project).options(*opts).where(Project.id == project_id, not_deleted(Project))
+    stmt = (
+        select(Project)
+        .options(*opts)
+        .where(Project.id == project_id, not_deleted(Project))
+    )
     project = (await db.execute(stmt)).scalars().first()
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
@@ -158,7 +187,7 @@ async def _assert_project_access(project: Project, user: User, *, write: bool = 
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
         return
     if user.role == "client":
-        if write or project.client_id != user.client_id:
+        if write or not project_has_client(project, user.client_id):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
         return
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
@@ -173,6 +202,7 @@ async def list_projects(
         select(Project)
         .options(
             selectinload(Project.client),
+            selectinload(Project.clients),
             selectinload(Project.workers),
             selectinload(Project.recurring_invoices)
         )
@@ -232,30 +262,50 @@ async def get_project(
     await _assert_project_access(project, current_user)
     return await _sanitize_project(db, project, current_user.role)
 
+
+@router.post("/{project_id}/clients", response_model=ProjectResponse)
+async def link_project_client(
+    project_id: str,
+    payload: ProjectClientAdd,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_founder_ceo),
+):
+    await add_client_to_project(db, project_id, payload.client_id)
+    await db.commit()
+    project = await _load_project(db, project_id)
+    return sanitize_project_for_role(project, "founder_ceo")
+
+
+@router.delete("/{project_id}/clients/{client_id}", response_model=ProjectResponse)
+async def unlink_project_client(
+    project_id: str,
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_founder_ceo),
+):
+    await remove_client_from_project(db, project_id, client_id)
+    await db.commit()
+    project = await _load_project(db, project_id)
+    return sanitize_project_for_role(project, "founder_ceo")
+
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 async def create_project(
     payload: ProjectCreate,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    # Verify client exists
-    c_res = await db.execute(select(Client).where(Client.id == payload.client_id))
-    if not c_res.scalars().first():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client not found")
-
-    project = Project(
+    project = await create_project_record(
+        db,
         name=payload.name,
+        client_ids=payload.client_ids,
         client_id=payload.client_id,
         description=payload.description,
-        start_date=None,
-        end_date=None,
         budget_paise=payload.budget_paise or 0,
         development_days=payload.development_days,
         status="lead",
         delivery_phase=5,
     )
-    db.add(project)
-    await db.flush()
+    primary_id = project.client_id
     await ensure_project_checklist(db, project, done_through_stage=0)
 
     if payload.worker_ids:
@@ -270,7 +320,7 @@ async def create_project(
         send_day = min(max(1, m.send_day), 28)
 
         rec = RecurringInvoice(
-            client_id=payload.client_id,
+            client_id=primary_id,
             project_id=project.id,
             amount_paise=m.amount_paise,
             send_day=send_day,
@@ -292,18 +342,7 @@ async def create_project(
 
     await db.commit()
 
-    # Re-fetch with relationships
-    stmt = (
-        select(Project)
-        .options(
-            selectinload(Project.client),
-            selectinload(Project.workers),
-            selectinload(Project.recurring_invoices)
-        )
-        .where(Project.id == project.id)
-    )
-    res = await db.execute(stmt)
-    created_prj = res.scalars().first()
+    created_prj = await _load_project(db, project.id)
     return sanitize_project_for_role(created_prj, "founder_ceo")
 
 
@@ -668,6 +707,21 @@ async def update_project(
     worker_ids = update_data.pop("worker_ids", None)
     maintenance_amount = update_data.pop("maintenance_amount_paise", None)
     update_data.pop("advance_paise", None)
+    client_ids = update_data.pop("client_ids", None)
+    primary_client_id = update_data.pop("client_id", None)
+
+    if client_ids is not None:
+        await set_project_clients(
+            db,
+            project,
+            client_ids,
+            primary_client_id=primary_client_id,
+        )
+    elif primary_client_id is not None:
+        # Promote an already-linked client to primary, or add+promote
+        if not project_has_client(project, primary_client_id):
+            await add_client_to_project(db, project.id, primary_client_id)
+        project.client_id = primary_client_id
 
     for k, v in update_data.items():
         setattr(project, k, v)
@@ -704,12 +758,7 @@ async def delete_project(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_founder_ceo)
 ):
-    res = await db.execute(select(Project).where(Project.id == project_id, not_deleted(Project)))
-    project = res.scalars().first()
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-
-    project.soft_delete()
+    await delete_project_record(db, project_id)
     await db.commit()
     return {"message": "Project deleted successfully"}
 

@@ -325,6 +325,8 @@ async def _ensure_project_internal(
         if eng.notes:
             project.description = eng.notes
     else:
+        from ..services.project_clients import set_project_clients
+
         project = Project(
             name=(project_name or eng.title).strip(),
             client_id=eng.client_id,
@@ -336,6 +338,7 @@ async def _ensure_project_internal(
         )
         db.add(project)
         await db.flush()
+        await set_project_clients(db, project, [eng.client_id], primary_client_id=eng.client_id)
         eng.project_id = project.id
 
     if worker_ids:
@@ -888,7 +891,9 @@ async def link_client(
 ):
     eng = await _load_engagement(db, engagement_id)
     if payload.client_id:
-        client = (await db.execute(select(Client).where(Client.id == payload.client_id, not_deleted(Client)))).scalars().first()
+        client = (
+            await db.execute(select(Client).where(Client.id == payload.client_id, not_deleted(Client)))
+        ).scalars().first()
         if not client:
             raise HTTPException(status_code=404, detail="Client not found")
         eng.client_id = client.id
@@ -955,7 +960,9 @@ async def link_invoice(
     current_user: User = Depends(require_founder_ceo),
 ):
     eng = await _load_engagement(db, engagement_id)
-    inv = (await db.execute(select(Invoice).where(Invoice.id == payload.invoice_id, not_deleted(Invoice)))).scalars().first()
+    inv = (
+        await db.execute(select(Invoice).where(Invoice.id == payload.invoice_id, not_deleted(Invoice)))
+    ).scalars().first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
     if payload.role == "advance":

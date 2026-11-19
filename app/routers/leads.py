@@ -123,6 +123,8 @@ async def convert_lead(
 
     project_id: Optional[str] = None
     if payload.create_project:
+        from ..services.project_clients import set_project_clients
+
         project_name = payload.project_name or f"{client.name} Implementation"
         project = Project(
             name=project_name,
@@ -133,6 +135,7 @@ async def convert_lead(
         )
         db.add(project)
         await db.flush()
+        await set_project_clients(db, project, [client.id], primary_client_id=client.id)
         project_id = project.id
 
     # 2. Update lead status to won
