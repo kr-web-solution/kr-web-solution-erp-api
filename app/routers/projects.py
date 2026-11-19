@@ -37,6 +37,7 @@ from ..schemas import (
     ProjectFeatureDocCreate,
     ProjectFeatureDocResponse,
     ProjectDocumentResponse,
+    ProjectDocumentUpdate,
 )
 from ..services.audit import snapshot_entity, write_audit
 from ..services.client_project import (
@@ -469,6 +470,7 @@ async def upload_project_document(
     project_id: str,
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
     doc_kind: str = Form("other"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo),
@@ -484,6 +486,7 @@ async def upload_project_document(
     doc = ProjectDocument(
         project_id=project.id,
         title=label,
+        description=(description or "").strip() or None,
         original_filename=original,
         stored_filename=stored,
         content_type=content_type,
@@ -492,6 +495,45 @@ async def upload_project_document(
         uploaded_by=current_user.id,
     )
     db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+    return ProjectDocumentResponse.model_validate(doc)
+
+
+@router.patch("/{project_id}/documents/{doc_id}", response_model=ProjectDocumentResponse)
+async def update_project_document(
+    project_id: str,
+    doc_id: str,
+    payload: ProjectDocumentUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_founder_ceo),
+):
+    await _load_project(db, project_id)
+    doc = (
+        await db.execute(
+            select(ProjectDocument).where(
+                ProjectDocument.id == doc_id,
+                ProjectDocument.project_id == project_id,
+                not_deleted(ProjectDocument),
+            )
+        )
+    ).scalars().first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    data = payload.model_dump(exclude_unset=True)
+    if "title" in data:
+        title = (data["title"] or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="Title is required")
+        doc.title = title
+    if "description" in data:
+        desc = data["description"]
+        doc.description = (desc or "").strip() or None
+    if "doc_kind" in data and data["doc_kind"] is not None:
+        kind = data["doc_kind"]
+        doc.doc_kind = kind if kind in DOC_KINDS else doc.doc_kind
+
     await db.commit()
     await db.refresh(doc)
     return ProjectDocumentResponse.model_validate(doc)

@@ -358,10 +358,19 @@ class ProjectFeatureDocCreate(BaseModel):
     doc_type: str = "note"  # note, link, spec
 
 
+class ProjectDocumentUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = None
+    description: Optional[str] = None
+    doc_kind: Optional[str] = None
+
+
 class ProjectDocumentResponse(OrmBase):
     id: str
     project_id: str
     title: str
+    description: Optional[str] = None
     original_filename: str
     content_type: str
     size_bytes: int
