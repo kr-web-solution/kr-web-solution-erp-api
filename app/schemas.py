@@ -433,8 +433,15 @@ class InvoiceCreate(BaseModel):
     monthly_rate_paise: Optional[int] = None
 
 class InvoiceUpdate(BaseModel):
+    """Explicit allow-list for invoice PATCH (F-003).
+
+    ``project_id`` / ``client_id`` are intentionally absent — changing them on an
+    existing invoice is rejected (422 via extra=forbid, or 400 in the router).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     invoice_type: Optional[str] = None
-    project_id: Optional[str] = None
     issue_date: Optional[date] = None
     due_date: Optional[date] = None
     tax_rate_percent: Optional[float] = None
@@ -520,8 +527,10 @@ class RecurringInvoiceCreate(BaseModel):
 MaintenancePlanCreate = RecurringInvoiceCreate
 
 class RecurringInvoiceUpdate(BaseModel):
-    client_id: Optional[str] = None
-    project_id: Optional[str] = None
+    """Allow-list for plan PATCH. project_id/client_id cannot be reassigned here."""
+
+    model_config = ConfigDict(extra="forbid")
+
     amount_paise: Optional[int] = None
     send_day: Optional[int] = Field(None, ge=1, le=28)
     due_after_days: Optional[int] = Field(None, ge=1)

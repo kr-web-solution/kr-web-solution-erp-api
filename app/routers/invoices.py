@@ -508,9 +508,34 @@ async def update_invoice(
     old_subtotal = int(inv.subtotal_paise or 0)
     was_sent = inv.status in ("sent", "overdue")
     update_dict = payload.model_dump(exclude_unset=True)
+    # Defense in depth if a future field sneaks onto the schema
+    if "project_id" in update_dict or "client_id" in update_dict:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="project_id and client_id cannot be changed on an existing invoice",
+        )
     new_items = update_dict.pop("items", None)
 
+    _ALLOWED_INVOICE_PATCH = {
+        "invoice_type",
+        "issue_date",
+        "due_date",
+        "tax_rate_percent",
+        "notes",
+        "status",
+        "upi_id_override",
+        "upi_qr_url",
+        "period_months",
+        "covers_from",
+        "covers_to",
+        "monthly_rate_paise",
+    }
     for k, v in update_dict.items():
+        if k not in _ALLOWED_INVOICE_PATCH:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Field '{k}' cannot be updated on an invoice",
+            )
         setattr(inv, k, v)
 
     if new_items is not None:
