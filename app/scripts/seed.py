@@ -155,6 +155,9 @@ async def seed_database_async():
     3. Soft-delete dummy seed logins
     4. SUPER_ADMIN bootstrap when users table empty
     """
+    from ..core.db_target_guard import assert_migration_or_seed_allowed
+
+    assert_migration_or_seed_allowed(settings.DATABASE_URL, tool="seed")
     await init_db()
 
     async with AsyncSessionLocal() as session:

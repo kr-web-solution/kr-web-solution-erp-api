@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.core.config import settings
 from app.core.database import Base
+from app.core.db_target_guard import assert_migration_or_seed_allowed
 import app.models  # Ensure all models are registered
 
 config = context.config
@@ -23,6 +24,7 @@ if config.config_file_name is not None:
 
 # Set database URL dynamically from app settings
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+assert_migration_or_seed_allowed(settings.DATABASE_URL, tool="alembic")
 
 target_metadata = Base.metadata
 

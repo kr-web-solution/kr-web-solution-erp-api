@@ -5,16 +5,20 @@ from __future__ import annotations
 import os
 
 # --- Hard safety gate (must run before importing app / opening any DB) ---
-# Prefer TEST_DATABASE_URL; never fall back to a non-test DATABASE_URL from .env.
+# Tests ignore .env DATABASE_URL entirely. Only TEST_DATABASE_URL (or the local
+# default below) is used. A polluted shell TEST_DATABASE_URL pointing at a
+# non-test DB name is aborted by assert_safe_test_database.
 _DEFAULT_TEST_URL = (
     "postgresql+asyncpg://postgres:udhaya@localhost:5432/kr-web-solution-erp-test"
 )
-TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", _DEFAULT_TEST_URL).strip()
+# Do not read DATABASE_URL from the environment/.env for tests.
+TEST_DB_URL = (os.environ.get("TEST_DATABASE_URL") or _DEFAULT_TEST_URL).strip()
 
 # Force local/test env so Settings validators and the guard stay consistent.
 os.environ["ENVIRONMENT"] = "test"
 os.environ["PRODUCTION"] = "false"
 os.environ["DATABASE_URL"] = TEST_DB_URL
+os.environ["FORCE_TEST_OUTBOUND"] = "1"
 
 from tests.db_safety import UnsafeTestDatabaseError, assert_safe_test_database  # noqa: E402
 
