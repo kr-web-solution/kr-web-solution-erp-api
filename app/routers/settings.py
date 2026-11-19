@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from ..core.dependencies import get_db, require_founder_ceo
+from fastapi.responses import FileResponse
+
+from ..core.dependencies import get_db, get_current_user, require_founder_ceo
 from ..core.security import encrypt_secret
 from ..models import Settings, EmailTemplate, User
 from ..schemas import (
@@ -240,20 +242,41 @@ async def upload_upi_qr(
 
 
 @router.get("/upi-qr-file/{filename}")
-async def get_upi_qr_file(filename: str):
-    """Serve uploaded UPI QR (no auth — clients need it on invoice pages)."""
-    from fastapi.responses import FileResponse
+async def get_upi_qr_file(
+    filename: str,
+    _: User = Depends(get_current_user),
+):
+    """Serve uploaded UPI QR to authenticated users only.
 
+    Choice: (a) session auth — QR is only shown in authenticated UI (settings +
+    invoice pages); PDFs/emails do not fetch this HTTP endpoint for the image.
+    """
+    # Basename only — blocks path traversal (../, absolute paths, etc.)
     safe = Path(filename).name
+    if not safe or safe != filename or ".." in filename or "/" in filename or "\\" in filename:
+        # Do not reveal whether a traversal target existed
+        raise HTTPException(status_code=404, detail="QR image not found")
+
     path = Path(__file__).resolve().parents[2] / "uploads" / "brand" / safe
+    try:
+        path.resolve().relative_to((Path(__file__).resolve().parents[2] / "uploads" / "brand").resolve())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="QR image not found")
+
     if not path.is_file():
         raise HTTPException(status_code=404, detail="QR image not found")
+
     media = "image/png"
     if safe.lower().endswith((".jpg", ".jpeg")):
         media = "image/jpeg"
     elif safe.lower().endswith(".webp"):
         media = "image/webp"
-    return FileResponse(path, media_type=media)
+
+    return FileResponse(
+        path,
+        media_type=media,
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @router.get("/email-templates", response_model=List[EmailTemplateResponse])
