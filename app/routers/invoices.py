@@ -967,7 +967,8 @@ async def upload_payment_proof(
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
     _assert_invoice_access(inv, current_user)
-    assert_can_upload_payment_proof(inv)
+    allow_paid_archive = is_privileged(current_user.role)
+    assert_can_upload_payment_proof(inv, allow_paid_archive=allow_paid_archive)
 
     key, original, content_type, _size = await save_payment_proof(inv.id, file)
     before = {"status": inv.status, "has_payment_proof": bool(inv.payment_proof_object_key)}
@@ -977,10 +978,14 @@ async def upload_payment_proof(
     inv.payment_proof_uploaded_at = datetime.now(timezone.utc)
     inv.payment_proof_uploaded_by = current_user.id
     inv.payment_proof_note = (note or "").strip() or None
-    inv.payment_verified_at = None
-    inv.payment_verified_by = None
+    # Unpaid → await founder verify; paid archive upload keeps paid + marks verified
     if inv.status in ("sent", "overdue"):
+        inv.payment_verified_at = None
+        inv.payment_verified_by = None
         apply_status(inv, "proof_pending")
+    elif inv.status == "paid":
+        inv.payment_verified_at = inv.payment_verified_at or datetime.now(timezone.utc)
+        inv.payment_verified_by = inv.payment_verified_by or current_user.id
 
     await write_audit(
         db,

@@ -70,8 +70,11 @@ def assert_can_pay(invoice: Any) -> None:
     assert_transition(invoice.status, "paid")
 
 
-def assert_can_upload_payment_proof(invoice: Any) -> None:
+def assert_can_upload_payment_proof(invoice: Any, *, allow_paid_archive: bool = False) -> None:
+    """Clients upload while unpaid; founders may attach proof on paid invoices for records."""
     if invoice.status == "paid":
+        if allow_paid_archive:
+            return
         raise InvoiceStatusError("Invoice is already paid")
     if invoice.status in ("cancelled", "void"):
         raise InvoiceStatusError("Cannot upload proof for a cancelled invoice")
