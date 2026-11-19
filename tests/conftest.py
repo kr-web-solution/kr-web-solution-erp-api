@@ -3,27 +3,43 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
-
-TEST_DB_URL = os.environ.get(
-    "TEST_DATABASE_URL",
-    "postgresql+asyncpg://postgres:udhaya@localhost:5432/kr-web-solution-erp-test",
+# --- Hard safety gate (must run before importing app / opening any DB) ---
+# Prefer TEST_DATABASE_URL; never fall back to a non-test DATABASE_URL from .env.
+_DEFAULT_TEST_URL = (
+    "postgresql+asyncpg://postgres:udhaya@localhost:5432/kr-web-solution-erp-test"
 )
+TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", _DEFAULT_TEST_URL).strip()
 
+# Force local/test env so Settings validators and the guard stay consistent.
+os.environ["ENVIRONMENT"] = "test"
+os.environ["PRODUCTION"] = "false"
 os.environ["DATABASE_URL"] = TEST_DB_URL
-# Keep startup validators happy in CI/local tests
-os.environ.setdefault("ENVIRONMENT", "local")
+
+from tests.db_safety import UnsafeTestDatabaseError, assert_safe_test_database  # noqa: E402
+
+try:
+    _SAFE_DB_NAME = assert_safe_test_database(
+        database_url=TEST_DB_URL,
+        environment=os.environ.get("ENVIRONMENT"),
+        production_flag=os.environ.get("PRODUCTION"),
+    )
+except UnsafeTestDatabaseError as exc:
+    raise SystemExit(f"TEST SAFETY ABORT: {exc}") from exc
+
+from datetime import datetime, timezone  # noqa: E402
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import select  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from sqlalchemy.pool import NullPool  # noqa: E402
 
 from app.core.config import settings  # noqa: E402
 
 settings.DATABASE_URL = TEST_DB_URL
-settings.ENVIRONMENT = "local"
+settings.ENVIRONMENT = "test"
+settings.PRODUCTION = False
 
 import app.core.database as db_module  # noqa: E402
 
@@ -39,7 +55,7 @@ from app.models import Client, Project, ProjectClient, Settings, User  # noqa: E
 from app.services.user_identity import apply_role_to_user, ensure_roles_seeded  # noqa: E402
 from main import app  # noqa: E402
 
-# Known passwords for API role tests — created by ensure_test_users, not seed.py demos
+# Known passwords for API role tests — created by ensure_test_users, only in the test DB
 TEST_PASSWORD = "TestPass!2026"
 TEST_USERS = {
     "founder": {
@@ -64,7 +80,12 @@ TEST_USERS = {
 
 
 async def ensure_test_users() -> dict:
-    """Upsert founder/worker/client users + a client org. Idempotent."""
+    """Upsert founder/worker/client users + a client org. Idempotent. Test DB only."""
+    assert_safe_test_database(
+        database_url=TEST_DB_URL,
+        environment="test",
+        production_flag="false",
+    )
     async with TestingSessionLocal() as session:
         await ensure_roles_seeded(session)
 
@@ -126,6 +147,7 @@ async def ensure_test_users() -> dict:
         return {
             "client_org_id": client_org.id,
             "users": {k: u.id for k, u in created.items()},
+            "database": _SAFE_DB_NAME,
         }
 
 
@@ -154,7 +176,7 @@ async def make_project_with_client(
     )
     session.add(project)
     await session.flush()
-    session.add(ProjectClient(project_id=project.id, client_id=client_id))
+    session.add(ProjectClient(project_id=project.id, client_id=client_id, is_primary=True))
     await session.flush()
     return project
 

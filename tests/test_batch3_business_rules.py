@@ -104,7 +104,10 @@ async def test_soft_deleted_invoice_and_engagement_404(client: TestClient, found
 
 @pytest.mark.asyncio
 async def test_concurrent_last_client_removal_blocked():
-    """Two concurrent removals of the last two clients must leave ≥1 client."""
+    """Two real PostgreSQL sessions: concurrent last-two removals leave ≥1 client.
+
+    Relies on SELECT … FOR UPDATE in ``remove_client_from_project``.
+    """
     async with TestingSessionLocal() as session:
         a = await _make_client(session, "Conc A")
         b = await _make_client(session, "Conc B")
@@ -127,11 +130,99 @@ async def test_concurrent_last_client_removal_blocked():
 
     results = await asyncio.gather(remove_one(aid), remove_one(bid))
     assert "ok" in results
-    # At least one removal must be blocked OR exactly one client remains
+    assert "blocked" in results or results.count("ok") == 1
     async with TestingSessionLocal() as session:
         rows = (
             await session.execute(
                 select(ProjectClient).where(ProjectClient.project_id == pid)
             )
         ).scalars().all()
-        assert len(rows) >= 1
+        assert len(rows) >= 1, f"FOR UPDATE failed: {len(rows)} clients left; results={results}"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_removal_without_for_update_can_wipe_clients(monkeypatch):
+    """Proof: if SELECT … FOR UPDATE is removed, two sessions can leave 0 clients.
+
+    Uses a delayed unlocked path that mirrors the old race (check then delete).
+    """
+    from sqlalchemy import delete
+    from app.models import Project
+    from app.services import client_project as cp
+
+    async with TestingSessionLocal() as session:
+        a = await _make_client(session, "Race A")
+        b = await _make_client(session, "Race B")
+        project = await create_project(session, name="Race Project", client_ids=[a.id, b.id])
+        await session.commit()
+        pid, aid, bid = project.id, a.id, b.id
+
+    async def unlocked_remove(db, project_id: str, client_id: str):
+        # Intentionally NO for_update — demonstrates why the lock is required.
+        project = (
+            await db.execute(select(Project).where(Project.id == project_id))
+        ).scalars().first()
+        rows = (
+            await db.execute(
+                select(ProjectClient).where(ProjectClient.project_id == project_id)
+            )
+        ).scalars().all()
+        current_ids = [r.client_id for r in rows]
+        if client_id not in current_ids:
+            raise BusinessRuleError("not on project")
+        if len(current_ids) <= 1:
+            raise BusinessRuleError("Cannot remove the last client from a project")
+        await asyncio.sleep(0.15)  # widen race window
+        await db.execute(
+            delete(ProjectClient).where(
+                ProjectClient.project_id == project_id,
+                ProjectClient.client_id == client_id,
+            )
+        )
+        await db.flush()
+        return project
+
+    monkeypatch.setattr(cp, "remove_client_from_project", unlocked_remove)
+
+    async def remove_one(cid: str):
+        async with TestingSessionLocal() as session:
+            try:
+                await cp.remove_client_from_project(session, pid, cid)
+                await session.commit()
+                return "ok"
+            except BusinessRuleError:
+                await session.rollback()
+                return "blocked"
+            except Exception:
+                await session.rollback()
+                raise
+
+    # Retry a few times — races are probabilistic without a lock
+    wiped = False
+    for _ in range(8):
+        async with TestingSessionLocal() as session:
+            # reset membership to two clients
+            await session.execute(
+                delete(ProjectClient).where(ProjectClient.project_id == pid)
+            )
+            session.add(ProjectClient(project_id=pid, client_id=aid, is_primary=True))
+            session.add(ProjectClient(project_id=pid, client_id=bid, is_primary=False))
+            await session.commit()
+
+        results = await asyncio.gather(remove_one(aid), remove_one(bid))
+        async with TestingSessionLocal() as session:
+            n = len(
+                (
+                    await session.execute(
+                        select(ProjectClient).where(ProjectClient.project_id == pid)
+                    )
+                ).scalars().all()
+            )
+        if n == 0 and results.count("ok") == 2:
+            wiped = True
+            break
+
+    assert wiped, (
+        "Expected unlocked concurrent removals to leave 0 clients at least once; "
+        "FOR UPDATE is required to prevent this race"
+    )
