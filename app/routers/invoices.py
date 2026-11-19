@@ -68,6 +68,7 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
         id=inv.id,
         invoice_number=inv.invoice_number,
         invoice_type=inv.invoice_type,
+        ledger=getattr(inv, "ledger", None) or "development",
         client_id=inv.client_id,
         client_name=inv.client.name if inv.client else None,
         project_id=inv.project_id,
@@ -307,13 +308,12 @@ async def create_invoice(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Settings record not found")
 
     from ..services.invoice_numbers import assign_unique_invoice_number
-    from ..services.project_money import ledger_for
+    from ..services.invoice_typing import normalize_line_kind, resolve_invoice_typing
 
-    raw_type = payload.invoice_type or "custom_dev"
-    if raw_type == "project":
-        raw_type = "custom_dev"
-    if raw_type == "maintenance":
-        raw_type = "amc"
+    raw_type, ledger, number_hint = resolve_invoice_typing(
+        invoice_type=payload.invoice_type,
+        items=payload.items,
+    )
 
     # Calculate subtotal from items; GST only when enabled in Settings
     subtotal_paise = sum(int(round(float(item.quantity) * item.unit_rate_paise)) for item in payload.items)
@@ -321,13 +321,20 @@ async def create_invoice(
     tax_paise = compute_tax_paise(subtotal_paise, tax_rate)
     total_paise = subtotal_paise + tax_paise
 
+    initial_status = (payload.status or "draft").strip().lower()
+    if initial_status not in ("draft", "sent", "paid", "overdue"):
+        initial_status = "draft"
+    paid_at = payload.paid_at
+    if initial_status == "paid" and paid_at is None:
+        paid_at = datetime.combine(payload.issue_date, datetime.min.time(), tzinfo=timezone.utc)
+
     invoice = Invoice(
         invoice_number="",
         invoice_type=raw_type,
-        ledger=ledger_for(raw_type),
+        ledger=ledger,
         client_id=payload.client_id,
         project_id=payload.project_id,
-        status="draft",
+        status=initial_status,
         issue_date=payload.issue_date,
         due_date=payload.due_date,
         subtotal_paise=subtotal_paise,
@@ -341,12 +348,13 @@ async def create_invoice(
         covers_from=payload.covers_from,
         covers_to=payload.covers_to,
         monthly_rate_paise=payload.monthly_rate_paise,
+        paid_at=paid_at,
     )
     try:
         await assign_unique_invoice_number(
             db,
             invoice,
-            invoice_type=raw_type,
+            invoice_type=number_hint,
             issue_date=payload.issue_date,
             settings_row=st,
         )
@@ -360,10 +368,11 @@ async def create_invoice(
             description=item.description,
             quantity=item.quantity,
             unit_rate_paise=item.unit_rate_paise,
-            amount_paise=amt
+            amount_paise=amt,
+            line_kind=normalize_line_kind(item.line_kind, raw_type if raw_type != "mixed" else "custom_dev"),
         ))
 
-    if raw_type == "amc" and payload.project_id and payload.covers_to:
+    if (raw_type in ("amc", "mixed")) and payload.project_id and payload.covers_to:
         await _hold_maintenance_emails(db, payload.project_id, payload.covers_to)
 
     await write_audit(
@@ -575,6 +584,8 @@ async def update_invoice(
         apply_status(inv, requested_status)
 
     if new_items is not None:
+        from ..services.invoice_typing import normalize_line_kind, resolve_invoice_typing
+
         # Delete existing items and add new items
         for old_it in inv.items:
             await db.delete(old_it)
@@ -591,9 +602,19 @@ async def update_invoice(
                 description=item_data.get("description", ""),
                 quantity=qty,
                 unit_rate_paise=rate,
-                amount_paise=amt
+                amount_paise=amt,
+                line_kind=normalize_line_kind(
+                    item_data.get("line_kind"),
+                    inv.invoice_type or "custom_dev",
+                ),
             ))
         inv.subtotal_paise = subtotal_paise
+        header_type, header_ledger, _ = resolve_invoice_typing(
+            invoice_type=update_dict.get("invoice_type") or inv.invoice_type,
+            items=new_items,
+        )
+        inv.invoice_type = header_type
+        inv.ledger = header_ledger
 
     st = await _load_settings(db)
     if "tax_rate_percent" in update_dict or new_items is not None:
@@ -607,6 +628,8 @@ async def update_invoice(
         inv.ledger = "maintenance"
         if inv.project_id and inv.covers_to:
             await _hold_maintenance_emails(db, inv.project_id, inv.covers_to)
+    elif inv.invoice_type == "mixed" and inv.project_id and inv.covers_to:
+        await _hold_maintenance_emails(db, inv.project_id, inv.covers_to)
 
     if was_sent and int(inv.subtotal_paise or 0) != old_subtotal:
         db.add(InvoiceAuditLog(

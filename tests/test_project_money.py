@@ -61,6 +61,42 @@ def test_amc_edit_does_not_touch_development():
     assert summary["maintenance"]["outstanding"] == 1_800_000
 
 
+def test_mixed_invoice_splits_dev_and_maintenance_by_line_kind():
+    project = _project(budget_paise=1_500_000)
+    summary = summarize_invoices(
+        project,
+        [
+            _inv(
+                invoice_type="mixed",
+                ledger="mixed",
+                status="paid",
+                subtotal_paise=850_000,
+                tax_paise=0,
+                covers_from=date(2026, 10, 22),
+                covers_to=date(2026, 10, 30),
+                period_months=1,
+                items=[
+                    SimpleNamespace(
+                        line_kind="custom_dev",
+                        amount_paise=750_000,
+                    ),
+                    SimpleNamespace(
+                        line_kind="amc",
+                        amount_paise=100_000,
+                    ),
+                ],
+            )
+        ],
+    )
+    assert summary["development"]["total_invoiced"] == 750_000
+    assert summary["development"]["total_paid"] == 750_000
+    assert summary["development"]["custom_invoiced"] == 750_000
+    assert summary["maintenance"]["total_invoiced"] == 100_000
+    assert summary["maintenance"]["total_paid"] == 100_000
+    assert summary["maintenance"]["billed_through"] == "2026-10-30"
+    assert summary["development"]["remaining_to_invoice"] == 750_000
+
+
 def test_six_month_amc_paid_moves_billed_through():
     project = _project()
     summary = summarize_invoices(

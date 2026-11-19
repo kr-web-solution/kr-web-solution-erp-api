@@ -411,12 +411,17 @@ class InvoiceItemBase(BaseModel):
     description: str
     quantity: float = 1.0
     unit_rate_paise: int
+    # Optional per-line kind so one invoice can mix development + maintenance, etc.
+    # Aliases accepted: development/dev → custom_dev, maintenance/mnt → amc
+    line_kind: Optional[str] = None
 
 class InvoiceItemResponse(InvoiceItemBase, OrmBase):
     id: str
     amount_paise: int
+    line_kind: Optional[str] = None
 
 class InvoiceCreate(BaseModel):
+    # custom_dev | amc | advance | balance | mixed | … — mixed auto-detected from line_kind
     invoice_type: str = "custom_dev"
     client_id: str
     project_id: str
@@ -431,6 +436,9 @@ class InvoiceCreate(BaseModel):
     covers_from: Optional[date] = None
     covers_to: Optional[date] = None
     monthly_rate_paise: Optional[int] = None
+    # When creating already-settled historical invoices
+    status: Optional[str] = None
+    paid_at: Optional[datetime] = None
 
 class InvoiceUpdate(BaseModel):
     """Explicit allow-list for invoice PATCH (F-003).
@@ -463,7 +471,8 @@ class CreditNoteCreate(BaseModel):
 class InvoiceResponse(OrmBase):
     id: str
     invoice_number: str
-    invoice_type: str  # "project", "maintenance", "late_fee", "credit_note"
+    invoice_type: str  # custom_dev | amc | mixed | late_fee | credit_note | …
+    ledger: str = "development"  # development | maintenance | mixed
     client_id: str
     client_name: Optional[str] = None
     project_id: Optional[str] = None

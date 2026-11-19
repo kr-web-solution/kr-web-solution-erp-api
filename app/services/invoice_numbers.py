@@ -31,6 +31,7 @@ INVOICE_SERVICE_CODES: Dict[str, str] = {
     "licensing": "LIC",
     "late_fee": "SVC",
     "credit_note": "CRN",
+    "mixed": "MIX",
 }
 
 INVOICE_SERVICE_LABELS: Dict[str, str] = {
@@ -40,6 +41,7 @@ INVOICE_SERVICE_LABELS: Dict[str, str] = {
     "SVC": "Services",
     "LIC": "Licensing",
     "CRN": "Credit note",
+    "MIX": "Mixed",
 }
 
 DEFAULT_COMPANY_CODE = "KRWS"

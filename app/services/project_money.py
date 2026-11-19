@@ -22,6 +22,8 @@ EXCLUDED = {"cancelled", "void"}
 def ledger_for(invoice_type: str) -> str:
     if invoice_type in AMC_TYPES:
         return "maintenance"
+    if (invoice_type or "").strip().lower() == "mixed":
+        return "mixed"
     return "development"
 
 
@@ -115,6 +117,52 @@ def summarize_invoices(project, invoices: Iterable) -> dict:
         tax = _tax(inv)
         paid = _paid(inv)
         ledger = getattr(inv, "ledger", None) or ledger_for(getattr(inv, "invoice_type", "") or "")
+        items = list(getattr(inv, "items", None) or [])
+        has_line_kinds = any(getattr(it, "line_kind", None) for it in items)
+
+        # Mixed / multi-kind invoice: allocate by line_kind (tax proportional to line share)
+        if (getattr(inv, "invoice_type", "") or "") == "mixed" or (
+            has_line_kinds and len({(getattr(it, "line_kind", None) or kind) for it in items}) > 1
+        ):
+            for it in items:
+                line_amt = int(getattr(it, "amount_paise", 0) or 0)
+                if line_amt <= 0 or sub <= 0:
+                    continue
+                line_tax = int(round(tax * (line_amt / sub))) if tax else 0
+                lk = (getattr(it, "line_kind", None) or "").strip().lower()
+                if lk in AMC_TYPES or lk in ("maintenance", "amc", "mnt"):
+                    maint["total_invoiced"] += line_amt
+                    maint["gst_invoiced"] += line_tax
+                    if paid:
+                        maint["total_paid"] += line_amt
+                        maint["gst_paid"] += line_tax
+                else:
+                    dev["total_invoiced"] += line_amt
+                    dev["gst_invoiced"] += line_tax
+                    if paid:
+                        dev["total_paid"] += line_amt
+                        dev["gst_paid"] += line_tax
+                    if lk == "advance":
+                        dev["advance_invoiced"] += line_amt
+                        if paid:
+                            dev["advance_paid"] += line_amt
+                    elif lk == "balance":
+                        dev["balance_invoiced"] += line_amt
+                        if paid:
+                            dev["balance_paid"] += line_amt
+                    else:
+                        dev["custom_invoiced"] += line_amt
+                        if paid:
+                            dev["custom_paid"] += line_amt
+            covers_to = getattr(inv, "covers_to", None)
+            if isinstance(covers_to, date) and (billed_through is None or covers_to > billed_through):
+                billed_through = covers_to
+            if paid and isinstance(covers_to, date) and (paid_through is None or covers_to > paid_through):
+                paid_through = covers_to
+                paid_from = getattr(inv, "covers_from", None)
+                paid_months = int(getattr(inv, "period_months", 0) or 0)
+            continue
+
         if kind == "amc" or ledger == "maintenance":
             maint["total_invoiced"] += sub
             maint["gst_invoiced"] += tax

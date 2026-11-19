@@ -564,6 +564,9 @@ class InvoiceItem(SoftDeleteMixin, Base):
     quantity: Mapped[float] = mapped_column(Numeric(10, 2), default=1.00, nullable=False)
     unit_rate_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     amount_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # Per-line service: custom_dev | amc | advance | balance | hosting | …
+    # Lets one invoice mix development + maintenance (and other) amounts.
+    line_kind: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
 
     # Relationship
     invoice: Mapped["Invoice"] = relationship("Invoice", back_populates="items")
