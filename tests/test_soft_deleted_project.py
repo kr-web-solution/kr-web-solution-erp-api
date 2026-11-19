@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.core.database import AsyncSessionLocal
 from app.core.dependencies import get_current_user
-from app.models import Client, Project, User
+from app.models import Client, Project, ProjectClient, User
 from main import app
 
 
@@ -40,6 +40,8 @@ async def test_soft_deleted_project_detail_update_subresource_404(founder_client
             status="lead",
         )
         session.add(project)
+        await session.flush()
+        session.add(ProjectClient(project_id=project.id, client_id=c.id))
         await session.commit()
         pid = project.id
 
