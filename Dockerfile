@@ -7,8 +7,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH="/opt/venv/bin:$PATH"
 
+# libpq for asyncpg; pango/cairo/gdk-pixbuf/fonts for WeasyPrint invoice PDFs
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libpq-dev \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        libpq-dev \
+        libcairo2 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libgdk-pixbuf-2.0-0 \
+        libffi-dev \
+        shared-mime-info \
+        fonts-dejavu-core \
+        fonts-liberation \
+        fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m venv /opt/venv
