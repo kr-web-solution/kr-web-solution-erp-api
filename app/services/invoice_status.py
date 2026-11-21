@@ -7,7 +7,11 @@ from typing import Any, Optional
 from ..core.exceptions import BusinessRuleError, ConflictException
 
 TERMINAL_STATUSES = frozenset({"paid", "cancelled", "void"})
-LOCKED_STATUSES = TERMINAL_STATUSES  # cannot edit or soft-delete
+LOCKED_STATUSES = TERMINAL_STATUSES  # cannot soft-delete / full-edit
+# Full content lock only after payment (or cancel/void). Unpaid sent invoices stay editable.
+ISSUED_CONTENT_LOCKED = frozenset({"paid", "cancelled", "void"})
+# Soft patches still allowed on issued unpaid invoices (due date, notes, UPI override).
+ISSUED_SOFT_EDITABLE = frozenset({"sent", "overdue", "proof_pending"})
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "draft": frozenset({"sent", "paid", "cancelled", "void"}),
@@ -50,11 +54,30 @@ def assert_editable(status: str) -> None:
         raise InvoiceStatusError("Cannot edit a cancelled invoice")
 
 
+def assert_content_editable(status: str) -> None:
+    """Block amount/item/tax/type changes after payment (or cancel/void)."""
+    if (status or "") in ISSUED_CONTENT_LOCKED:
+        raise ConflictException(
+            "Paid / cancelled invoices are locked. Issue a credit note for corrections."
+        )
+
+
+def assert_soft_editable(status: str) -> None:
+    """Allow limited patches on issued unpaid invoices; block terminal states."""
+    assert_editable(status)
+    if (status or "") not in ("draft", *ISSUED_SOFT_EDITABLE):
+        raise InvoiceStatusError(f"Cannot edit invoice while status is {status}")
+
+
 def assert_deletable(status: str) -> None:
     if status == "paid":
         raise InvoiceStatusError("Cannot delete paid invoice")
     if status in ("cancelled", "void"):
         raise InvoiceStatusError("Cannot delete a cancelled invoice")
+    if (status or "") in ISSUED_CONTENT_LOCKED and status not in ("cancelled", "void", "paid"):
+        # Soft-delete of sent invoices still allowed for founders via existing endpoint rules;
+        # keep paid/cancelled blocked above.
+        pass
 
 
 def apply_status(invoice: Any, target: str) -> None:

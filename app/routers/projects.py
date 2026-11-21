@@ -8,21 +8,31 @@ from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
 from ..core.database import not_deleted
-from ..common.workflow import DELIVERY_MAX_STAGE, DELIVERY_MIN_STAGE, WARRANTY_DEFAULT_DAYS
+from ..common.workflow import (
+    DELIVERY_MAX_STAGE,
+    DELIVERY_MIN_STAGE,
+    HANDOVER_PHASE,
+    WARRANTY_DEFAULT_DAYS,
+)
 from ..models import (
     Project,
     User,
     ProjectWorker,
+    ProjectStatusEvent,
+    ProjectFeatureEvent,
+    ProjectChecklistEvent,
     RecurringInvoice,
     ProjectFeature,
     ProjectFeatureDoc,
     ProjectDocument,
+    ProjectPhaseNote,
     Engagement,
 )
 from ..schemas import (
     ProjectResponse,
     ProjectCreate,
     ProjectUpdate,
+    ProjectMilestoneRequest,
     ProjectClientAdd,
     ProjectClientBrief,
     ProjectProrataResponse,
@@ -30,6 +40,8 @@ from ..schemas import (
     ProjectInvoiceCreateResponse,
     UserResponse,
     ProjectChecklistItemResponse,
+    ProjectPhaseNoteResponse,
+    ProjectPhaseNoteUpdate,
     ProjectDeliveryDetailResponse,
     ProjectFeatureCreate,
     ProjectFeatureUpdate,
@@ -38,6 +50,18 @@ from ..schemas import (
     ProjectFeatureDocResponse,
     ProjectDocumentResponse,
     ProjectDocumentUpdate,
+)
+from ..services.project_status import (
+    apply_status_fields,
+    assert_can_complete,
+    assert_transition,
+)
+from ..services.feature_status import (
+    CLIENT_VISIBLE as CLIENT_VISIBLE_FEATURE_STATUSES,
+    CR_STATUSES as FEATURE_STATUSES,
+    REQUEST_TYPES as FEATURE_REQUEST_TYPES,
+    assert_transition as assert_feature_transition,
+    normalize_status as normalize_feature_status,
 )
 from ..services.audit import snapshot_entity, write_audit
 from ..services.client_project import (
@@ -70,8 +94,19 @@ from ..services.maintenance_billing import (
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
-FEATURE_STATUSES = {"requested", "approved", "in_progress", "done", "rejected"}
-CLIENT_VISIBLE_FEATURE_STATUSES = {"approved", "in_progress", "done"}
+FEATURE_PRIORITIES = {"low", "medium", "high", "urgent"}
+
+
+async def _next_cr_number(db: AsyncSession) -> str:
+    year = date.today().year
+    prefix = f"CR-{year}-"
+    result = await db.execute(
+        select(func.count())
+        .select_from(ProjectFeature)
+        .where(ProjectFeature.cr_number.like(f"{prefix}%"))
+    )
+    n = int(result.scalar() or 0) + 1
+    return f"{prefix}{n:04d}"
 
 
 def sanitize_project_for_role(
@@ -98,6 +133,16 @@ def sanitize_project_for_role(
             "balance_invoice_id": getattr(project, "balance_invoice_id", None),
             "go_live_at": getattr(project, "go_live_at", None),
             "status": project.status,
+            "status_reason": getattr(project, "status_reason", None),
+            "reopened_at": getattr(project, "reopened_at", None),
+            "reopened_by": getattr(project, "reopened_by", None),
+            "development_completed_at": getattr(project, "development_completed_at", None),
+            "development_completed_by": getattr(project, "development_completed_by", None),
+            "client_accepted_at": getattr(project, "client_accepted_at", None),
+            "client_accepted_by": getattr(project, "client_accepted_by", None),
+            "project_closed_at": getattr(project, "project_closed_at", None),
+            "project_closed_by": getattr(project, "project_closed_by", None),
+            "closed_reason": getattr(project, "closed_reason", None),
             "delivery_phase": getattr(project, "delivery_phase", None) or 5,
             "engagement_id": getattr(project, "engagement_id", None),
             "created_at": project.created_at,
@@ -284,7 +329,9 @@ async def project_money(
     await _assert_project_access(project, current_user, db=db)
     invoices = (
         await db.execute(
-            select(Invoice).where(
+            select(Invoice)
+            .options(selectinload(Invoice.items))
+            .where(
                 Invoice.project_id == project.id,
                 not_deleted(Invoice),
             )
@@ -425,8 +472,9 @@ async def create_project(
 @router.post("/{project_id}/start", response_model=ProjectResponse)
 async def start_project(
     project_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo),
+    current_user: User = Depends(require_founder_ceo),
 ):
     """Start a not-started project: today + development days becomes the deadline."""
     project = await _load_project(db, project_id)
@@ -441,7 +489,23 @@ async def start_project(
     today = date.today()
     project.start_date = today
     project.end_date = today + timedelta(days=days)
-    project.status = "running"
+    await _apply_project_status_change(
+        db,
+        project,
+        new_status="running",
+        current_user=current_user,
+        privileged=True,
+        reason="Project started",
+    )
+    await write_audit(
+        db,
+        current_user,
+        "projects",
+        project.id,
+        "update",
+        after={"status": "running", "start_date": str(today)},
+        request=request,
+    )
     await db.commit()
     project = await _load_project(db, project_id)
     return sanitize_project_for_role(project, "founder_ceo")
@@ -575,8 +639,9 @@ async def download_project_document(
 async def delete_project_document(
     project_id: str,
     doc_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo),
+    current_user: User = Depends(require_founder_ceo),
 ):
     await _load_project(db, project_id)
     doc = (
@@ -590,10 +655,19 @@ async def delete_project_document(
     ).scalars().first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    delete_stored(project_id, doc.stored_filename)
-    await db.delete(doc)
+    # Soft-delete: keep file on disk for history; do not unlink yet
+    doc.soft_delete()
+    await write_audit(
+        db,
+        current_user,
+        "project_documents",
+        doc.id,
+        "soft_delete",
+        after={"deleted": True, "project_id": project_id},
+        request=request,
+    )
     await db.commit()
-    return {"message": "Document deleted"}
+    return {"message": "Document archived"}
 
 
 @router.post("/{project_id}/maintenance/toggle", response_model=ProjectResponse)
@@ -800,6 +874,76 @@ async def create_project_balance_invoice(
     )
 
 
+async def _record_status_change(
+    db: AsyncSession,
+    project: Project,
+    *,
+    from_status: str,
+    to_status: str,
+    actor_id: Optional[str],
+    reason: Optional[str] = None,
+) -> None:
+    if from_status == to_status:
+        return
+    db.add(
+        ProjectStatusEvent(
+            project_id=project.id,
+            from_status=from_status,
+            to_status=to_status,
+            reason=(reason or None),
+            actor_id=actor_id,
+        )
+    )
+
+
+async def _apply_project_status_change(
+    db: AsyncSession,
+    project: Project,
+    *,
+    new_status: str,
+    current_user: User,
+    privileged: bool,
+    reason: Optional[str] = None,
+    force_complete: bool = False,
+    force_complete_reason: Optional[str] = None,
+) -> None:
+    prev = project.status
+    reopen_reason = reason if prev in ("stopped", "completed") and new_status == "running" else reason
+    assert_transition(prev, new_status, privileged=privileged, reason=reopen_reason)
+    if new_status == "completed" and prev != "completed":
+        # Ensure checklist is loaded when completing via PATCH
+        if not getattr(project, "checklist_items", None):
+            project = await _load_project(
+                db, project.id, selectinload(Project.checklist_items)
+            )
+        assert_can_complete(
+            delivery_phase=project.delivery_phase or DELIVERY_MIN_STAGE,
+            checklist_items=project.checklist_items or [],
+            force=force_complete,
+            force_reason=force_complete_reason,
+        )
+        project.project_closed_at = datetime.now(timezone.utc)
+        project.project_closed_by = current_user.id
+        if force_complete_reason:
+            project.closed_reason = force_complete_reason.strip()
+        elif reason:
+            project.closed_reason = reason.strip()
+    apply_status_fields(
+        project,
+        new_status=new_status,
+        actor_id=current_user.id,
+        reason=reason if new_status == "stopped" else (reopen_reason if prev in ("stopped", "completed") else reason),
+    )
+    await _record_status_change(
+        db,
+        project,
+        from_status=prev,
+        to_status=new_status,
+        actor_id=current_user.id,
+        reason=reopen_reason or reason or force_complete_reason,
+    )
+
+
 @router.patch("/{project_id}", response_model=ProjectResponse)
 async def update_project(
     project_id: str,
@@ -808,7 +952,7 @@ async def update_project(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    project = await _load_project(db, project_id)
+    project = await _load_project(db, project_id, selectinload(Project.checklist_items))
     before = snapshot_entity(project, ["name", "status", "client_id", "budget_paise", "description"])
 
     if current_user.role == "worker":
@@ -816,8 +960,15 @@ async def update_project(
         if current_user.id not in worker_ids:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-        if payload.status:
-            project.status = payload.status
+        if payload.status and payload.status != project.status:
+            await _apply_project_status_change(
+                db,
+                project,
+                new_status=payload.status,
+                current_user=current_user,
+                privileged=False,
+                reason=payload.status_reason or payload.reopen_reason,
+            )
         await write_audit(
             db,
             current_user,
@@ -843,6 +994,11 @@ async def update_project(
     update_data.pop("advance_paise", None)
     client_ids = update_data.pop("client_ids", None)
     primary_client_id = update_data.pop("client_id", None)
+    new_status = update_data.pop("status", None)
+    status_reason = update_data.pop("status_reason", None)
+    reopen_reason = update_data.pop("reopen_reason", None)
+    force_complete = bool(update_data.pop("force_complete", False) or False)
+    force_complete_reason = update_data.pop("force_complete_reason", None)
 
     if client_ids is not None:
         await set_project_clients(
@@ -863,19 +1019,49 @@ async def update_project(
     # Timeline starts only when a start date is set by hand.
     if "start_date" in update_data and not project.start_date:
         project.end_date = None
-        if project.status == "running":
-            project.status = "lead"
+        if project.status == "running" and new_status is None:
+            await _apply_project_status_change(
+                db,
+                project,
+                new_status="lead",
+                current_user=current_user,
+                privileged=True,
+                reason="Start date cleared",
+            )
     elif project.start_date and project.development_days and int(project.development_days) > 0:
         if "end_date" not in update_data:
             project.end_date = project.start_date + timedelta(days=int(project.development_days))
-        if "start_date" in update_data and project.status == "lead":
-            project.status = "running"
+        if "start_date" in update_data and project.status == "lead" and new_status is None:
+            await _apply_project_status_change(
+                db,
+                project,
+                new_status="running",
+                current_user=current_user,
+                privileged=True,
+                reason="Start date set",
+            )
+
+    if new_status is not None and new_status != project.status:
+        reason = reopen_reason or status_reason
+        await _apply_project_status_change(
+            db,
+            project,
+            new_status=new_status,
+            current_user=current_user,
+            privileged=True,
+            reason=reason,
+            force_complete=force_complete,
+            force_complete_reason=force_complete_reason,
+        )
 
     if worker_ids is not None:
         await db.execute(delete(ProjectWorker).where(ProjectWorker.project_id == project.id))
         for w_id in worker_ids:
-            w_res = await db.execute(select(User).where(User.id == w_id))
-            if w_res.scalars().first():
+            w_res = await db.execute(
+                select(User).where(User.id == w_id, User.is_active == True)  # noqa: E712
+            )
+            user_row = w_res.scalars().first()
+            if user_row:
                 db.add(ProjectWorker(project_id=project.id, user_id=w_id))
 
     if maintenance_amount is not None:
@@ -917,7 +1103,139 @@ async def delete_project(
     return {"message": "Project deleted successfully"}
 
 
+@router.post("/{project_id}/milestones/development-completed", response_model=ProjectResponse)
+async def mark_development_completed(
+    project_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    project = await _load_project(db, project_id)
+    if not project.development_completed_at:
+        project.development_completed_at = datetime.now(timezone.utc)
+        project.development_completed_by = current_user.id
+        await write_audit(
+            db,
+            current_user,
+            "projects",
+            project.id,
+            "update",
+            after={"milestone": "development_completed"},
+            request=request,
+        )
+        await db.commit()
+    refreshed = await _load_project(db, project.id)
+    return await _sanitize_project(db, refreshed, "founder_ceo")
+
+
+@router.post("/{project_id}/milestones/client-accepted", response_model=ProjectResponse)
+async def mark_client_accepted(
+    project_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    project = await _load_project(db, project_id)
+    if not project.client_accepted_at:
+        project.client_accepted_at = datetime.now(timezone.utc)
+        project.client_accepted_by = current_user.id
+        await write_audit(
+            db,
+            current_user,
+            "projects",
+            project.id,
+            "update",
+            after={"milestone": "client_accepted"},
+            request=request,
+        )
+        await db.commit()
+    refreshed = await _load_project(db, project.id)
+    return await _sanitize_project(db, refreshed, "founder_ceo")
+
+
+@router.post("/{project_id}/milestones/close", response_model=ProjectResponse)
+async def mark_project_closed(
+    project_id: str,
+    payload: ProjectMilestoneRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    project = await _load_project(db, project_id, selectinload(Project.checklist_items))
+    reason = (payload.reason or "").strip() or None
+    if project.status != "completed":
+        await _apply_project_status_change(
+            db,
+            project,
+            new_status="completed",
+            current_user=current_user,
+            privileged=True,
+            reason=reason,
+            force_complete=False,
+        )
+    elif not project.project_closed_at:
+        project.project_closed_at = datetime.now(timezone.utc)
+        project.project_closed_by = current_user.id
+        project.closed_reason = reason
+    await write_audit(
+        db,
+        current_user,
+        "projects",
+        project.id,
+        "update",
+        after={"milestone": "project_closed", "reason": reason},
+        request=request,
+    )
+    await db.commit()
+    refreshed = await _load_project(db, project.id)
+    return await _sanitize_project(db, refreshed, "founder_ceo")
+
+
 # ---------- Delivery (phases 05–11) ----------
+
+def _phase_notes_for_response(
+    project: Project, *, include: bool
+) -> List[ProjectPhaseNoteResponse]:
+    if not include:
+        return []
+    return [
+        ProjectPhaseNoteResponse(
+            stage_number=n.stage_number,
+            body=n.body,
+            updated_at=getattr(n, "updated_at", None),
+            updated_by=n.updated_by,
+        )
+        for n in (project.phase_notes or [])
+        if n.body and str(n.body).strip()
+    ]
+
+
+async def _delivery_detail_response(
+    project_id: str,
+    db: AsyncSession,
+    current_user: User,
+) -> ProjectDeliveryDetailResponse:
+    project = await _load_project(
+        db,
+        project_id,
+        selectinload(Project.checklist_items),
+        selectinload(Project.phase_notes),
+    )
+    base = sanitize_project_for_role(project, current_user.role)
+    items = list(project.checklist_items or [])
+    show_notes = current_user.role != "client"
+    if current_user.role == "client":
+        # Clients see phase progress only — no internal checklist ticks / notes
+        items = []
+    return ProjectDeliveryDetailResponse(
+        **base.model_dump(),
+        checklist_items=[ProjectChecklistItemResponse.model_validate(i) for i in items],
+        checklist_progress_percent=checklist_progress(
+            list(project.checklist_items or []), project.delivery_phase
+        ),
+        phase_notes=_phase_notes_for_response(project, include=show_notes),
+    )
+
 
 @router.get("/{project_id}/delivery", response_model=ProjectDeliveryDetailResponse)
 async def get_project_delivery(
@@ -929,20 +1247,60 @@ async def get_project_delivery(
     await _assert_project_access(project, current_user, db=db)
     await ensure_project_checklist(db, project, done_through_stage=0)
     await db.commit()
-    project = await _load_project(db, project_id, selectinload(Project.checklist_items))
+    return await _delivery_detail_response(project_id, db, current_user)
 
-    base = sanitize_project_for_role(project, current_user.role)
-    items = list(project.checklist_items or [])
+
+@router.patch(
+    "/{project_id}/delivery/phases/{stage_number}/note",
+    response_model=ProjectDeliveryDetailResponse,
+)
+async def upsert_project_phase_note(
+    project_id: str,
+    stage_number: int,
+    payload: ProjectPhaseNoteUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Save or clear an optional note for one delivery phase. Not required to advance."""
     if current_user.role == "client":
-        # Clients see phase progress only — no internal checklist ticks
-        items = []
-    return ProjectDeliveryDetailResponse(
-        **base.model_dump(),
-        checklist_items=[ProjectChecklistItemResponse.model_validate(i) for i in items],
-        checklist_progress_percent=checklist_progress(
-            list(project.checklist_items or []), project.delivery_phase
-        ),
+        raise HTTPException(status_code=403, detail="Clients cannot edit delivery notes")
+    if stage_number < DELIVERY_MIN_STAGE or stage_number > DELIVERY_MAX_STAGE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Stage must be a delivery phase ({DELIVERY_MIN_STAGE}–{DELIVERY_MAX_STAGE})",
+        )
+
+    project = await _load_project(
+        db,
+        project_id,
+        selectinload(Project.checklist_items),
+        selectinload(Project.phase_notes),
     )
+    await _assert_project_access(project, current_user, db=db)
+
+    body = (payload.body or "").strip() or None
+    existing = next(
+        (n for n in (project.phase_notes or []) if n.stage_number == stage_number),
+        None,
+    )
+    if body is None:
+        if existing:
+            await db.delete(existing)
+    elif existing:
+        existing.body = body
+        existing.updated_by = current_user.id
+    else:
+        db.add(
+            ProjectPhaseNote(
+                project_id=project.id,
+                stage_number=stage_number,
+                body=body,
+                updated_by=current_user.id,
+            )
+        )
+
+    await db.commit()
+    return await _delivery_detail_response(project_id, db, current_user)
 
 
 @router.post("/{project_id}/checklist/{item_id}/toggle", response_model=ProjectDeliveryDetailResponse)
@@ -959,9 +1317,41 @@ async def toggle_project_checklist(
     item = next((i for i in project.checklist_items if i.id == item_id), None)
     if not item:
         raise HTTPException(status_code=404, detail="Checklist item not found")
-    item.is_done = not item.is_done
-    item.done_at = datetime.now(timezone.utc) if item.is_done else None
-    item.done_by = current_user.id if item.is_done else None
+    becoming_done = not item.is_done
+    if not becoming_done and item.is_done:
+        db.add(
+            ProjectChecklistEvent(
+                item_id=item.id,
+                project_id=project.id,
+                action="undone",
+                actor_id=current_user.id,
+                done_at_snapshot=item.done_at,
+                done_by_snapshot=item.done_by,
+            )
+        )
+    item.is_done = becoming_done
+    item.done_at = datetime.now(timezone.utc) if becoming_done else None
+    item.done_by = current_user.id if becoming_done else None
+    if becoming_done:
+        db.add(
+            ProjectChecklistEvent(
+                item_id=item.id,
+                project_id=project.id,
+                action="done",
+                actor_id=current_user.id,
+                done_at_snapshot=item.done_at,
+                done_by_snapshot=item.done_by,
+            )
+        )
+    await write_audit(
+        db,
+        current_user,
+        "project_checklist_items",
+        item.id,
+        "update",
+        after={"is_done": item.is_done, "project_id": project.id},
+        request=None,
+    )
     await sync_engagement_from_project(db, project)
     await db.commit()
     return await get_project_delivery(project_id, db, current_user)
@@ -986,14 +1376,22 @@ async def advance_project_delivery(
 
     if phase >= DELIVERY_MAX_STAGE:
         if close_without_amc or is_privileged(current_user.role):
-            project.status = "completed"
+            if project.status != "completed":
+                await _apply_project_status_change(
+                    db,
+                    project,
+                    new_status="completed",
+                    current_user=current_user,
+                    privileged=is_privileged(current_user.role),
+                    reason="Delivery complete at maintenance phase",
+                )
             await sync_engagement_from_project(db, project)
             await db.commit()
             return await get_project_delivery(project_id, db, current_user)
-        raise HTTPException(status_code=400, detail="Already at AMC phase")
+        raise HTTPException(status_code=400, detail="Already at maintenance phase")
 
-    if phase == 10:
-        # Set warranty on linked engagement if present
+    if phase == HANDOVER_PHASE:
+        # Set warranty on linked engagement when leaving handover / closing without AMC
         if project.engagement_id:
             eng = (
                 await db.execute(select(Engagement).where(Engagement.id == project.engagement_id))
@@ -1001,8 +1399,18 @@ async def advance_project_delivery(
             if eng and not eng.warranty_ends_on:
                 eng.warranty_ends_on = date.today() + timedelta(days=WARRANTY_DEFAULT_DAYS)
         if close_without_amc:
-            project.status = "completed"
-            project.delivery_phase = 10
+            if not is_privileged(current_user.role):
+                raise HTTPException(status_code=403, detail="Only founders can close without AMC")
+            project.delivery_phase = HANDOVER_PHASE
+            if project.status != "completed":
+                await _apply_project_status_change(
+                    db,
+                    project,
+                    new_status="completed",
+                    current_user=current_user,
+                    privileged=True,
+                    reason="Closed without AMC at handover",
+                )
             await sync_engagement_from_project(db, project)
             await db.commit()
             return await get_project_delivery(project_id, db, current_user)
@@ -1016,15 +1424,23 @@ async def advance_project_delivery(
 @router.post("/{project_id}/delivery/regress", response_model=ProjectDeliveryDetailResponse)
 async def regress_project_delivery(
     project_id: str,
+    reopen_reason: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo),
 ):
     project = await _load_project(db, project_id, selectinload(Project.checklist_items))
     if project.delivery_phase <= DELIVERY_MIN_STAGE:
-        raise HTTPException(status_code=400, detail="Already at onboarding phase")
+        raise HTTPException(status_code=400, detail="Already at requirement analysis phase")
     project.delivery_phase -= 1
     if project.status == "completed":
-        project.status = "running"
+        await _apply_project_status_change(
+            db,
+            project,
+            new_status="running",
+            current_user=current_user,
+            privileged=True,
+            reason=reopen_reason or "Delivery phase regress from completed",
+        )
     await sync_engagement_from_project(db, project)
     await db.commit()
     return await get_project_delivery(project_id, db, current_user)
@@ -1032,13 +1448,28 @@ async def regress_project_delivery(
 
 # ---------- Additional features + docs ----------
 
-def _feature_to_response(feat: ProjectFeature, role: str) -> ProjectFeatureResponse:
+def _feature_to_response(
+    feat: ProjectFeature,
+    role: str,
+    *,
+    project: Optional[Project] = None,
+) -> ProjectFeatureResponse:
     resp = ProjectFeatureResponse.model_validate(feat)
-    resp.docs = [ProjectFeatureDocResponse.model_validate(d) for d in (feat.docs or [])]
-    if role == "worker":
-        pass
+    resp.docs = [
+        ProjectFeatureDocResponse.model_validate(d)
+        for d in (feat.docs or [])
+        if not getattr(d, "deleted_at", None)
+    ]
+    resp.status = normalize_feature_status(feat.status)
+    if project is not None:
+        resp.project_name = project.name
+        resp.client_name = project.client.name if project.client else None
     if role == "client":
-        resp.quoted_paise = feat.quoted_paise  # agreed add-on value ok to show
+        resp.internal_notes = None
+        resp.dev_cost_paise = None
+        resp.expense_paise = None
+        resp.dev_hours = None
+        resp.test_hours = None
     return resp
 
 
@@ -1053,39 +1484,97 @@ async def list_project_features(
     stmt = (
         select(ProjectFeature)
         .options(selectinload(ProjectFeature.docs))
-        .where(ProjectFeature.project_id == project_id)
+        .where(ProjectFeature.project_id == project_id, not_deleted(ProjectFeature))
         .order_by(ProjectFeature.created_at.desc())
     )
     feats = (await db.execute(stmt)).scalars().all()
     if current_user.role == "client":
-        feats = [f for f in feats if f.status in CLIENT_VISIBLE_FEATURE_STATUSES]
-    return [_feature_to_response(f, current_user.role) for f in feats]
+        feats = [
+            f
+            for f in feats
+            if normalize_feature_status(f.status) in CLIENT_VISIBLE_FEATURE_STATUSES
+        ]
+    return [_feature_to_response(f, current_user.role, project=project) for f in feats]
 
 
 @router.post("/{project_id}/features", response_model=ProjectFeatureResponse, status_code=status.HTTP_201_CREATED)
 async def create_project_feature(
     project_id: str,
     payload: ProjectFeatureCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_founder_ceo),
+    current_user: User = Depends(get_current_user),
 ):
     project = await _load_project(db, project_id)
-    status_val = payload.status if payload.status in FEATURE_STATUSES else "requested"
+    await _assert_project_access(project, current_user, db=db)
+    if current_user.role == "worker":
+        raise HTTPException(status_code=403, detail="Workers cannot create change requests")
+
+    # Clients may submit only; founders control estimation / commercial fields
+    is_client = current_user.role == "client"
+    if not is_client and not is_privileged(current_user.role):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    status_val = "submitted" if is_client else normalize_feature_status(
+        payload.status if payload.status in FEATURE_STATUSES else "submitted"
+    )
+    if status_val not in FEATURE_STATUSES:
+        status_val = "submitted"
+    request_type = (
+        payload.request_type if payload.request_type in FEATURE_REQUEST_TYPES else "new_feature"
+    )
+    priority = payload.priority if payload.priority in FEATURE_PRIORITIES else "medium"
     feat = ProjectFeature(
         project_id=project.id,
-        title=payload.title,
-        description=payload.description,
+        cr_number=await _next_cr_number(db),
+        title=payload.title.strip(),
+        description=(payload.description or "").strip() or None,
+        business_purpose=(payload.business_purpose or "").strip() or None,
+        request_type=request_type,
+        expected_functionality=(payload.expected_functionality or "").strip() or None,
+        priority=priority,
+        expected_date=payload.expected_date,
+        acceptance_criteria=(payload.acceptance_criteria or "").strip() or None,
         status=status_val,
-        quoted_paise=payload.quoted_paise,
+        quoted_paise=None if is_client else payload.quoted_paise,
+        submitted_by=current_user.id,
+        is_billable=True if is_client else bool(payload.is_billable),
+        dev_hours=None if is_client else payload.dev_hours,
+        test_hours=None if is_client else payload.test_hours,
+        complexity=None if is_client else payload.complexity,
+        dev_cost_paise=None if is_client else payload.dev_cost_paise,
+        expense_paise=None if is_client else payload.expense_paise,
+        estimated_delivery_date=None if is_client else payload.estimated_delivery_date,
+        assignee_user_id=None if is_client else payload.assignee_user_id,
+        internal_notes=None if is_client else ((payload.internal_notes or "").strip() or None),
     )
     db.add(feat)
+    await db.flush()
+    db.add(
+        ProjectFeatureEvent(
+            feature_id=feat.id,
+            from_status="-",
+            to_status=status_val,
+            actor_id=current_user.id,
+            reason="created",
+        )
+    )
+    await write_audit(
+        db,
+        current_user,
+        "project_features",
+        feat.id,
+        "create",
+        after={"cr_number": feat.cr_number, "title": feat.title, "status": feat.status},
+        request=request,
+    )
     await db.commit()
     feat = (
         await db.execute(
             select(ProjectFeature).options(selectinload(ProjectFeature.docs)).where(ProjectFeature.id == feat.id)
         )
     ).scalars().first()
-    return _feature_to_response(feat, current_user.role)
+    return _feature_to_response(feat, current_user.role, project=project)
 
 
 @router.patch("/{project_id}/features/{feature_id}", response_model=ProjectFeatureResponse)
@@ -1093,6 +1582,7 @@ async def update_project_feature(
     project_id: str,
     feature_id: str,
     payload: ProjectFeatureUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1105,36 +1595,87 @@ async def update_project_feature(
         await db.execute(
             select(ProjectFeature)
             .options(selectinload(ProjectFeature.docs))
-            .where(ProjectFeature.id == feature_id, ProjectFeature.project_id == project_id)
+            .where(
+                ProjectFeature.id == feature_id,
+                ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeature),
+            )
         )
     ).scalars().first()
     if not feat:
         raise HTTPException(status_code=404, detail="Feature not found")
 
     data = payload.model_dump(exclude_unset=True)
+    status_reason = data.pop("status_reason", None)
+    new_status = data.pop("status", None)
+    privileged = is_privileged(current_user.role)
+
     if current_user.role == "worker":
-        # Workers may only update status
-        data = {k: v for k, v in data.items() if k == "status"}
-    if "status" in data and data["status"] not in FEATURE_STATUSES:
-        raise HTTPException(status_code=400, detail="Invalid feature status")
+        data = {}
+        if new_status is None:
+            raise HTTPException(status_code=400, detail="Workers may only update status")
+
+    if "request_type" in data and data["request_type"] not in FEATURE_REQUEST_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid request type")
+    if "priority" in data and data["priority"] not in FEATURE_PRIORITIES:
+        raise HTTPException(status_code=400, detail="Invalid priority")
+
     for k, v in data.items():
         setattr(feat, k, v)
+
+    if new_status is not None:
+        target = normalize_feature_status(new_status)
+        assert_feature_transition(
+            feat.status,
+            target,
+            privileged=privileged,
+            reason=status_reason,
+            is_billable=bool(getattr(feat, "is_billable", True)),
+        )
+        prev = normalize_feature_status(feat.status)
+        feat.status = target
+        if target == "cancelled":
+            feat.cancel_reason = (status_reason or "").strip() or feat.cancel_reason
+        if target == "rejected":
+            feat.rejection_reason = (status_reason or "").strip() or feat.rejection_reason
+        if target == "completed" and not feat.client_accepted_at:
+            feat.client_accepted_at = datetime.now(timezone.utc)
+            feat.client_accepted_by = current_user.id
+        db.add(
+            ProjectFeatureEvent(
+                feature_id=feat.id,
+                from_status=prev,
+                to_status=target,
+                reason=status_reason,
+                actor_id=current_user.id,
+            )
+        )
+
+    await write_audit(
+        db,
+        current_user,
+        "project_features",
+        feat.id,
+        "update",
+        after={"status": feat.status, "title": feat.title},
+        request=request,
+    )
     await db.commit()
-    await db.refresh(feat)
     feat = (
         await db.execute(
             select(ProjectFeature).options(selectinload(ProjectFeature.docs)).where(ProjectFeature.id == feature_id)
         )
     ).scalars().first()
-    return _feature_to_response(feat, current_user.role)
+    return _feature_to_response(feat, current_user.role, project=project)
 
 
 @router.delete("/{project_id}/features/{feature_id}", status_code=status.HTTP_200_OK)
 async def delete_project_feature(
     project_id: str,
     feature_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo),
+    current_user: User = Depends(require_founder_ceo),
 ):
     await _load_project(db, project_id)
     feat = (
@@ -1148,9 +1689,18 @@ async def delete_project_feature(
     ).scalars().first()
     if not feat:
         raise HTTPException(status_code=404, detail="Feature not found")
-    await db.delete(feat)
+    feat.soft_delete()
+    await write_audit(
+        db,
+        current_user,
+        "project_features",
+        feat.id,
+        "soft_delete",
+        after={"deleted": True},
+        request=request,
+    )
     await db.commit()
-    return {"message": "Feature deleted"}
+    return {"message": "Change request archived"}
 
 
 @router.post(
@@ -1191,6 +1741,85 @@ async def create_feature_doc(
     return ProjectFeatureDocResponse.model_validate(doc)
 
 
+@router.post(
+    "/{project_id}/features/{feature_id}/attachments",
+    response_model=ProjectFeatureDocResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_feature_attachment(
+    project_id: str,
+    feature_id: str,
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    """Upload screenshot / document / video against a change request."""
+    await _load_project(db, project_id)
+    feat = (
+        await db.execute(
+            select(ProjectFeature).where(
+                ProjectFeature.id == feature_id,
+                ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeature),
+            )
+        )
+    ).scalars().first()
+    if not feat:
+        raise HTTPException(status_code=404, detail="Feature not found")
+
+    stored, original, content_type, size = await save_project_upload(project_id, file)
+    doc = ProjectFeatureDoc(
+        feature_id=feature_id,
+        title=(title or original).strip() or original,
+        body_or_url=original,
+        doc_type="attachment",
+        original_filename=original,
+        stored_filename=stored,
+        content_type=content_type,
+        size_bytes=size,
+        created_by=current_user.id,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+    return ProjectFeatureDocResponse.model_validate(doc)
+
+
+@router.get("/{project_id}/features/{feature_id}/attachments/{doc_id}/file")
+async def download_feature_attachment(
+    project_id: str,
+    feature_id: str,
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = await _load_project(db, project_id)
+    await _assert_project_access(project, current_user, db=db)
+    doc = (
+        await db.execute(
+            select(ProjectFeatureDoc)
+            .join(ProjectFeature)
+            .where(
+                ProjectFeatureDoc.id == doc_id,
+                ProjectFeatureDoc.feature_id == feature_id,
+                ProjectFeature.project_id == project_id,
+                not_deleted(ProjectFeatureDoc),
+            )
+        )
+    ).scalars().first()
+    if not doc or not doc.stored_filename:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    data = read_stored(project_id, doc.stored_filename)
+    return Response(
+        content=data,
+        media_type=doc.content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{doc.original_filename or doc.title}"'
+        },
+    )
+
+
 @router.delete("/{project_id}/features/{feature_id}/docs/{doc_id}", status_code=status.HTTP_200_OK)
 async def delete_feature_doc(
     project_id: str,
@@ -1214,7 +1843,7 @@ async def delete_feature_doc(
     ).scalars().first()
     if not doc:
         raise HTTPException(status_code=404, detail="Doc not found")
-    await db.delete(doc)
+    doc.soft_delete()
     await db.commit()
-    return {"message": "Doc deleted"}
+    return {"message": "Doc archived"}
 

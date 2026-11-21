@@ -43,9 +43,17 @@ VIEW_STATEMENTS = [
     SELECT
       c.id AS client_id,
       c.name AS client_name,
-      COUNT(i.id) FILTER (WHERE i.status IN ('sent', 'overdue'))::bigint AS open_invoice_count,
-      COALESCE(SUM(i.total_paise) FILTER (WHERE i.status IN ('sent', 'overdue')), 0)::bigint AS outstanding_paise,
-      COALESCE(SUM(i.total_paise) FILTER (WHERE i.status = 'paid'), 0)::bigint AS paid_paise,
+      COUNT(i.id) FILTER (
+        WHERE i.status IN ('sent', 'overdue', 'proof_pending')
+      )::bigint AS open_invoice_count,
+      COALESCE(SUM(
+        GREATEST(i.total_paise - COALESCE(i.amount_paid_paise, 0), 0)
+      ) FILTER (
+        WHERE i.status IN ('sent', 'overdue', 'proof_pending')
+      ), 0)::bigint AS outstanding_paise,
+      COALESCE(SUM(i.amount_paid_paise) FILTER (
+        WHERE i.status NOT IN ('draft', 'cancelled', 'void')
+      ), 0)::bigint AS paid_paise,
       COALESCE(SUM(i.total_paise) FILTER (
         WHERE i.status NOT IN ('draft', 'cancelled', 'void')
       ), 0)::bigint AS billed_paise
@@ -59,7 +67,9 @@ VIEW_STATEMENTS = [
     SELECT
       (SELECT COUNT(*) FROM projects WHERE deleted_at IS NULL AND status = 'running')::bigint AS running_projects,
       (SELECT COUNT(*) FROM leads WHERE deleted_at IS NULL AND status IN ('new', 'contacted', 'proposal'))::bigint AS open_leads,
-      (SELECT COALESCE(SUM(total_paise), 0) FROM invoices WHERE deleted_at IS NULL AND status IN ('sent', 'overdue'))::bigint AS outstanding_paise,
+      (SELECT COALESCE(SUM(GREATEST(total_paise - COALESCE(amount_paid_paise, 0), 0)), 0)
+         FROM invoices
+         WHERE deleted_at IS NULL AND status IN ('sent', 'overdue', 'proof_pending'))::bigint AS outstanding_paise,
       (SELECT COUNT(*) FROM invoices WHERE deleted_at IS NULL AND status = 'overdue')::bigint AS overdue_invoices,
       (SELECT COUNT(*) FROM invoices WHERE deleted_at IS NULL AND email_status = 'failed')::bigint AS failed_email_invoices,
       (SELECT COUNT(*) FROM late_fee_actions WHERE deleted_at IS NULL AND status = 'pending')::bigint AS pending_late_fees,

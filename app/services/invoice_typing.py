@@ -22,6 +22,7 @@ LINE_KIND_ALIASES = {
     "licensing": "licensing",
     "late_fee": "late_fee",
     "credit_note": "credit_note",
+    "debit_note": "debit_note",
     "mixed": "mixed",
 }
 

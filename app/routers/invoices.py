@@ -7,7 +7,15 @@ from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
 from ..core.database import not_deleted
-from ..models import Invoice, InvoiceItem, Settings, RecurringInvoice, User, LateFeeAction
+from ..models import (
+    Invoice,
+    InvoiceItem,
+    InvoicePayment,
+    Settings,
+    RecurringInvoice,
+    User,
+    LateFeeAction,
+)
 from ..services.audit import snapshot_entity, write_audit
 from ..services.invoice_status import (
     apply_status,
@@ -16,21 +24,42 @@ from ..services.invoice_status import (
     assert_can_send,
     assert_can_upload_payment_proof,
     assert_can_verify_payment,
-    assert_deletable,
+    assert_content_editable,
     assert_editable,
+    assert_soft_editable,
 )
 from ..schemas import (
-    InvoiceResponse, InvoiceCreate, InvoiceUpdate, InvoiceItemResponse,
-    RecurringInvoiceResponse, RecurringInvoiceCreate, RecurringInvoiceUpdate,
-    LateFeeActionResponse, LateFeeDecisionRequest, CreditNoteCreate,
+    InvoiceResponse,
+    InvoiceCreate,
+    InvoiceUpdate,
+    InvoiceItemResponse,
+    InvoicePaymentResponse,
+    InvoicePaymentCreate,
+    InvoicePaymentReject,
+    RecurringInvoiceResponse,
+    RecurringInvoiceCreate,
+    RecurringInvoiceUpdate,
+    LateFeeActionResponse,
+    LateFeeDecisionRequest,
+    CreditNoteCreate,
+    DebitNoteCreate,
+)
+from ..services.invoice_payments import (
+    assert_payment_mutable,
+    assert_unique_reference,
+    maybe_mark_invoice_paid,
+    recalc_amount_paid,
 )
 from ..services.pdf import generate_invoice_pdf
 from ..services.email import send_email_async
+from ..services.amount_in_words import amount_in_words_inr
+from ..services.invoice_terms import resolve_invoice_terms
 from ..services.tax_payroll import (
     effective_tax_rate,
     compute_tax_paise,
     gst_is_enabled,
     resolve_payment_upi,
+    apply_invoice_tax_snapshot,
 )
 
 router = APIRouter(prefix="/invoices", tags=["Invoices"])
@@ -58,15 +87,72 @@ async def _load_settings(db: AsyncSession) -> Optional[Settings]:
     return (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
 
 
+async def _gst_toggle_response_fields(
+    db: AsyncSession,
+    inv: Optional[Invoice],
+    st: Optional[Settings],
+) -> tuple[bool, Optional[str]]:
+    """(can_change_gst, gst_toggle_preview_number) for InvoiceResponse."""
+    if not inv:
+        return False, None
+    from ..services.invoice_numbers import (
+        can_change_gst_series,
+        number_is_non_gst_series,
+        peek_lowest_free_invoice_number,
+    )
+
+    can_gst = await can_change_gst_series(db, inv)
+    if not can_gst:
+        return False, None
+    want_gst = number_is_non_gst_series(inv.invoice_number)
+    preview = await peek_lowest_free_invoice_number(
+        db,
+        invoice_type=inv.invoice_type or "custom_dev",
+        issue_date=inv.issue_date,
+        settings_row=st,
+        gst_enabled=want_gst,
+    )
+    return True, preview
+
+
 def _invoice_eager_options(*, include_parent: bool = False):
     opts = [
         selectinload(Invoice.client),
         selectinload(Invoice.project),
         selectinload(Invoice.items),
+        selectinload(Invoice.payments),
     ]
     if include_parent:
         opts.append(selectinload(Invoice.parent_invoice))
     return opts
+
+
+def _record_invoice_payment(
+    *,
+    inv: Invoice,
+    amount_paise: int,
+    method: Optional[str],
+    reference: Optional[str],
+    note: Optional[str],
+    recorded_by: Optional[str],
+    paid_at: Optional[datetime] = None,
+) -> InvoicePayment:
+    amt = max(0, int(amount_paise or 0))
+    now = paid_at or datetime.now(timezone.utc)
+    pay = InvoicePayment(
+        invoice_id=inv.id,
+        amount_paise=amt,
+        method=(method or "bank_transfer"),
+        reference=(reference or None),
+        note=(note or None),
+        recorded_by=recorded_by,
+        paid_at=now,
+        status="verified",
+        verified_by=recorded_by,
+        verified_at=now,
+    )
+    inv.amount_paid_paise = int(getattr(inv, "amount_paid_paise", 0) or 0) + amt
+    return pay
 
 
 def _loaded_parent_invoice(inv: Invoice) -> Optional[Invoice]:
@@ -80,13 +166,62 @@ def _loaded_parent_invoice(inv: Invoice) -> Optional[Invoice]:
     return getattr(inv, "parent_invoice", None)
 
 
-def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -> InvoiceResponse:
+def format_invoice_response(
+    inv: Invoice,
+    settings: Optional[Settings] = None,
+    *,
+    can_change_gst: bool = False,
+    gst_toggle_preview_number: Optional[str] = None,
+    can_delete: bool = False,
+) -> InvoiceResponse:
     # Query-time overdue calculation
     effective_status = inv.status
     if effective_status == "sent" and inv.due_date and inv.due_date < date.today():
         effective_status = "overdue"
 
+    amount_paid = int(getattr(inv, "amount_paid_paise", 0) or 0)
+    total = int(inv.total_paise or 0)
+    if effective_status not in ("paid", "cancelled", "void") and 0 < amount_paid < total:
+        # Surface partial payments without inventing a DB status code.
+        pass
+    elif effective_status == "paid" and amount_paid <= 0 and total > 0:
+        amount_paid = total
+
+    from ..services.invoice_snapshot import (
+        document_details_are_locked,
+        get_snapshot,
+        payment_details_are_locked,
+        snapshot_payment_has_data,
+    )
+    from ..services.payment_instructions import resolve_payment_instructions
+
+    snap = get_snapshot(inv)
+    doc_locked = document_details_are_locked(inv)
     pay = resolve_payment_upi(settings, inv) if settings else {"upi_id": None, "upi_qr_url": None}
+    pay_instr = resolve_payment_instructions(settings, upi_id=pay.get("upi_id"))
+    # Unpaid → live bank/UPI/PayPal. Paid/cancelled → frozen payment block.
+    if (
+        payment_details_are_locked(inv)
+        and snap
+        and isinstance(snap.get("payment"), dict)
+    ):
+        sp = snap["payment"]
+        snap_wire = [w for w in (sp.get("wire_instructions") or []) if str(w).strip()]
+        if snapshot_payment_has_data(sp):
+            pay_instr = {
+                "beneficiary": sp.get("beneficiary"),
+                "bank_name": sp.get("bank_name"),
+                "account_number": sp.get("account_number"),
+                "ifsc": sp.get("ifsc"),
+                "upi_id": sp.get("upi_id") or pay.get("upi_id"),
+                "paypal_id": sp.get("paypal_id"),
+                "wire_instructions": snap_wire,
+                "has_any": True,
+            }
+            if sp.get("upi_qr_url"):
+                pay["upi_qr_url"] = sp.get("upi_qr_url")
+        elif sp.get("upi_qr_url") and not pay.get("upi_qr_url"):
+            pay["upi_qr_url"] = sp.get("upi_qr_url")
 
     client = inv.client
     project = inv.project
@@ -94,33 +229,106 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
     project_ref = None
     if project and getattr(project, "id", None):
         project_ref = str(project.id).replace("prj_", "PRJ-").upper()
+    # Paid only: project ref from freeze. Unpaid: live project.
+    if (
+        doc_locked
+        and snap
+        and isinstance(snap.get("project"), dict)
+        and snap["project"].get("ref")
+    ):
+        project_ref = snap["project"]["ref"]
 
+    snap_client = (snap or {}).get("client") if isinstance(snap, dict) else None
+    snap_company = (snap or {}).get("company") if isinstance(snap, dict) else None
+    snap_terms = (snap or {}).get("terms") if isinstance(snap, dict) else None
+    # Unpaid invoices always use live company / client (ignore old freeze).
+    use_snap_company = doc_locked and isinstance(snap_company, dict)
+    use_snap_client = doc_locked and isinstance(snap_client, dict)
+
+    company_gstin = None
+    if use_snap_company:
+        company_gstin = snap_company.get("gstin")
+    elif settings:
+        company_gstin = getattr(settings, "company_gstin", None) or None
+        if not company_gstin and getattr(settings, "gst_unregistered", False):
+            company_gstin = "N/A"
+
+    payments_out: List[InvoicePaymentResponse] = []
+    try:
+        unloaded = sa_inspect(inv).unloaded
+    except Exception:
+        unloaded = set()
+    if "payments" not in unloaded:
+        for p in inv.payments or []:
+            if getattr(p, "deleted_at", None):
+                continue
+            payments_out.append(
+                InvoicePaymentResponse(
+                    id=p.id,
+                    amount_paise=int(p.amount_paise or 0),
+                    method=p.method,
+                    reference=p.reference,
+                    paid_at=p.paid_at,
+                    note=p.note,
+                    status=getattr(p, "status", None) or "verified",
+                    rejection_reason=getattr(p, "rejection_reason", None),
+                    recorded_by=p.recorded_by,
+                    verified_by=getattr(p, "verified_by", None),
+                    verified_at=getattr(p, "verified_at", None),
+                    rejected_by=getattr(p, "rejected_by", None),
+                    rejected_at=getattr(p, "rejected_at", None),
+                    has_proof=bool(getattr(p, "proof_object_key", None)),
+                )
+            )
+
+    if doc_locked and isinstance(snap_terms, list) and snap_terms:
+        resolved_terms = [str(t) for t in snap_terms if str(t).strip()]
+    else:
+        resolved_terms = resolve_invoice_terms(
+            invoice_type=inv.invoice_type,
+            invoice_notes=inv.notes,
+            settings=settings,
+            status=effective_status,
+        )
+
+    balance_due = max(0, total - amount_paid)
+    if effective_status in ("paid", "cancelled", "void", "credit_note") or inv.invoice_type == "credit_note":
+        if effective_status == "paid":
+            balance_due = 0
+
+    live_gst = gst_is_enabled(settings) if settings else False
+    inv_gst_override = getattr(inv, "gst_enabled", None)
+    if use_snap_company:
+        effective_gst = bool(snap_company.get("gst_enabled"))
+    elif inv_gst_override is not None:
+        effective_gst = bool(inv_gst_override)
+    else:
+        effective_gst = live_gst
     resp = InvoiceResponse(
         id=inv.id,
         invoice_number=inv.invoice_number,
         invoice_type=inv.invoice_type,
         ledger=getattr(inv, "ledger", None) or "development",
         client_id=inv.client_id,
-        client_name=client.name if client else None,
-        client_attn=getattr(client, "primary_contact_name", None) if client else None,
-        client_designation=getattr(client, "designation", None) if client else None,
-        client_email=(
-            (getattr(client, "contact_email", None) or getattr(client, "email", None))
-            if client
-            else None
-        ),
-        client_phone=(
-            (getattr(client, "contact_phone", None) or getattr(client, "phone", None))
-            if client
-            else None
-        ),
-        client_address=getattr(client, "address", None) if client else None,
-        client_city=getattr(client, "city", None) if client else None,
-        client_state=getattr(client, "state", None) if client else None,
-        client_pincode=getattr(client, "pincode", None) if client else None,
-        client_gstin=getattr(client, "gstin", None) if client else None,
+        client_name=(snap_client or {}).get("name") if use_snap_client else (client.name if client else None),
+        # Document bill-to is company-only; contact person is CC on email, not printed.
+        client_attn=None,
+        client_designation=None,
+        client_email=(snap_client or {}).get("email") if use_snap_client else (getattr(client, "email", None) if client else None),
+        client_phone=(snap_client or {}).get("phone") if use_snap_client else (getattr(client, "phone", None) if client else None),
+        client_address=(snap_client or {}).get("address") if use_snap_client else (getattr(client, "address", None) if client else None),
+        client_city=(snap_client or {}).get("city") if use_snap_client else (getattr(client, "city", None) if client else None),
+        client_state=(snap_client or {}).get("state") if use_snap_client else (getattr(client, "state", None) if client else None),
+        client_pincode=(snap_client or {}).get("pincode") if use_snap_client else (getattr(client, "pincode", None) if client else None),
+        client_gstin=(snap_client or {}).get("gstin") if use_snap_client else (getattr(client, "gstin", None) if client else None),
+        client_pan=(snap_client or {}).get("pan") if use_snap_client else (getattr(client, "pan", None) if client else None),
+        client_state_code=(snap_client or {}).get("state_code") if use_snap_client else (getattr(client, "state_code", None) if client else None),
         project_id=inv.project_id,
-        project_name=project.name if project else None,
+        project_name=(
+            (snap.get("project") or {}).get("name")
+            if doc_locked and snap
+            else (project.name if project else None)
+        ),
         project_ref=project_ref,
         status=effective_status,
         issue_date=inv.issue_date,
@@ -129,7 +337,23 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
         tax_rate_percent=float(inv.tax_rate_percent),
         tax_paise=inv.tax_paise,
         total_paise=inv.total_paise,
+        place_of_supply=getattr(inv, "place_of_supply", None),
+        supply_type=getattr(inv, "supply_type", None),
+        cgst_paise=int(getattr(inv, "cgst_paise", 0) or 0),
+        sgst_paise=int(getattr(inv, "sgst_paise", 0) or 0),
+        igst_paise=int(getattr(inv, "igst_paise", 0) or 0),
+        discount_paise=int(getattr(inv, "discount_paise", 0) or 0),
+        round_off_paise=int(getattr(inv, "round_off_paise", 0) or 0),
+        amount_paid_paise=amount_paid,
+        balance_due_paise=balance_due,
+        po_number=getattr(inv, "po_number", None),
+        amount_in_words=amount_in_words_inr(inv.total_paise),
         notes=inv.notes,
+        resolved_terms=resolved_terms,
+        snapshot_frozen_at=getattr(inv, "snapshot_frozen_at", None) if doc_locked else None,
+        # Locked only after payment / cancel / void — unpaid stays editable.
+        document_locked=doc_locked,
+        payments=payments_out,
         upi_id_override=getattr(inv, "upi_id_override", None),
         upi_qr_url=getattr(inv, "upi_qr_url", None),
         paid_at=inv.paid_at,
@@ -155,28 +379,62 @@ def format_invoice_response(inv: Invoice, settings: Optional[Settings] = None) -
         payment_verified_at=getattr(inv, "payment_verified_at", None),
         created_at=inv.created_at,
         items=[InvoiceItemResponse.model_validate(it) for it in (inv.items or [])],
-        payment_upi_id=pay.get("upi_id"),
+        payment_upi_id=pay_instr.get("upi_id") or pay.get("upi_id"),
         payment_upi_qr_url=pay.get("upi_qr_url"),
-        payment_bank_beneficiary_name=getattr(settings, "bank_beneficiary_name", None) if settings else None,
-        payment_bank_name=getattr(settings, "bank_name", None) if settings else None,
-        payment_bank_account_number=getattr(settings, "bank_account_number", None) if settings else None,
-        payment_bank_ifsc=getattr(settings, "bank_ifsc", None) if settings else None,
-        payment_bank_upi_details=getattr(settings, "bank_upi_details", None) if settings else None,
-        gst_enabled=gst_is_enabled(settings) if settings else False,
-        company_name=getattr(settings, "company_name", None) if settings else None,
-        company_address=getattr(settings, "company_address", None) if settings else None,
-        company_gstin=(
-            getattr(settings, "company_gstin", None)
-            if settings and gst_is_enabled(settings)
+        payment_bank_beneficiary_name=pay_instr.get("beneficiary"),
+        payment_bank_name=pay_instr.get("bank_name"),
+        payment_bank_account_number=pay_instr.get("account_number"),
+        payment_bank_ifsc=pay_instr.get("ifsc"),
+        payment_paypal_id=pay_instr.get("paypal_id"),
+        payment_bank_upi_details=(
+            (snap.get("payment") or {}).get("bank_upi_details")
+            if doc_locked
+            and snap
+            and snapshot_payment_has_data((snap or {}).get("payment"))
+            else (getattr(settings, "bank_upi_details", None) if settings else None)
+        ),
+        payment_bank_wire_instructions=(
+            "\n".join(pay_instr.get("wire_instructions") or [])
+            or (getattr(settings, "bank_wire_instructions", None) if settings else None)
+        ),
+        payment_wire_lines=list(pay_instr.get("wire_instructions") or []),
+        gst_enabled=effective_gst,
+        gst_enabled_override=None if use_snap_company else inv_gst_override,
+        can_change_gst=bool(can_change_gst),
+        gst_toggle_preview_number=gst_toggle_preview_number,
+        can_delete=bool(can_delete),
+        company_name=(snap_company or {}).get("name") if use_snap_company else (getattr(settings, "company_name", None) if settings else None),
+        company_address=(snap_company or {}).get("address") if use_snap_company else (getattr(settings, "company_address", None) if settings else None),
+        company_gstin=company_gstin if effective_gst else None,
+        company_email=(snap_company or {}).get("email") if use_snap_company else (getattr(settings, "smtp_from_email", None) if settings else None),
+        company_phone=(snap_company or {}).get("phone") if use_snap_company else (getattr(settings, "company_phone", None) if settings else None),
+        company_website=(snap_company or {}).get("website") if use_snap_company else (getattr(settings, "company_website", None) if settings else None),
+        company_tagline=(snap_company or {}).get("tagline") if use_snap_company else (getattr(settings, "company_tagline", None) if settings else None),
+        company_logo_url=(snap_company or {}).get("logo_url") if use_snap_company else (getattr(settings, "company_logo_url", None) if settings else None),
+        company_pan=(
+            ((snap_company or {}).get("pan") if use_snap_company else getattr(settings, "company_pan", None))
+            if effective_gst
             else None
         ),
-        company_email=getattr(settings, "smtp_from_email", None) if settings else None,
-        company_phone=getattr(settings, "company_phone", None) if settings else None,
-        company_website=getattr(settings, "company_website", None) if settings else None,
-        company_tagline=getattr(settings, "company_tagline", None) if settings else None,
-        company_logo_url=getattr(settings, "company_logo_url", None) if settings else None,
+        company_state=(snap_company or {}).get("state") if use_snap_company else (getattr(settings, "company_state", None) if settings else None),
+        company_state_code=(snap_company or {}).get("state_code") if use_snap_company else (getattr(settings, "company_state_code", None) if settings else None),
+        gst_unregistered=(
+            (
+                bool(snap_company.get("gst_unregistered"))
+                if use_snap_company
+                else bool(getattr(settings, "gst_unregistered", False)) if settings else False
+            )
+            if effective_gst
+            else False
+        ),
+        default_sac_code=(
+            getattr(settings, "default_sac_code", None) if settings and effective_gst else None
+        ),
         payment_terms=getattr(settings, "payment_terms", None) if settings else None,
     )
+    if not effective_gst:
+        resp.client_gstin = None
+        resp.client_pan = None
     return resp
 
 
@@ -186,6 +444,21 @@ async def _send_paid_receipt_email(db: AsyncSession, inv: Invoice, st: Optional[
         return
     if not inv.client or not inv.client.email:
         return
+    from ..services.email_html import compose_invoice_client_email
+    from ..services.invoice_mail import invoice_mail_targets
+    from ..services.invoice_snapshot import (
+        company_branding_from_snapshot,
+        freeze_document_snapshot,
+        get_snapshot,
+    )
+
+    freeze_document_snapshot(
+        inv,
+        client=inv.client,
+        settings=st,
+        project=inv.project,
+        parent_invoice=_loaded_parent_invoice(inv),
+    )
     pdf_bytes = generate_invoice_pdf(
         invoice=inv,
         client=inv.client,
@@ -194,14 +467,19 @@ async def _send_paid_receipt_email(db: AsyncSession, inv: Invoice, st: Optional[
         project=inv.project,
         parent_invoice=_loaded_parent_invoice(inv),
     )
-    from ..services.email_html import compose_invoice_client_email
 
+    brand = company_branding_from_snapshot(get_snapshot(inv), st)
+    snap = get_snapshot(inv) or {}
+    snap_company = snap.get("company") if isinstance(snap.get("company"), dict) else {}
+    to_email, cc_email = invoice_mail_targets(inv.client, st)
     _kind, subject, html, plain, attachment_name = compose_invoice_client_email(
-        company_name=st.company_name,
-        company_address=st.company_address or "",
-        company_gstin=st.company_gstin or "",
-        company_logo_url=st.company_logo_url or "/brand/krws-mark.png",
-        client_name=inv.client.primary_contact_name or inv.client.name,
+        company_name=brand["company_name"] or st.company_name,
+        company_address=brand["company_address"] or "",
+        company_gstin=brand["company_gstin"] or "",
+        company_logo_url=(snap_company.get("logo_url") if snap_company else None)
+        or st.company_logo_url
+        or "/brand/krws-mark.png",
+        client_name=inv.client.name,
         invoice_number=inv.invoice_number,
         total_paise=inv.total_paise,
         due_date=inv.due_date,
@@ -216,14 +494,14 @@ async def _send_paid_receipt_email(db: AsyncSession, inv: Invoice, st: Optional[
     )
     try:
         await send_email_async(
-            to_email=inv.client.email,
+            to_email=to_email,
             subject=subject,
             body=html,
             plain_body=plain,
             settings=st,
             attachment_bytes=pdf_bytes,
             attachment_filename=attachment_name,
-            cc_email=st.invoice_cc_email,
+            cc_email=cc_email,
             is_html=True,
         )
         inv.email_status = "sent"
@@ -281,7 +559,15 @@ async def list_invoices(
     invoices = res.scalars().all()
     st = await _load_settings(db)
 
-    formatted = [format_invoice_response(inv, st) for inv in invoices]
+    from ..services.invoice_numbers import can_delete_with_tips, live_series_tips
+
+    tips = await live_series_tips(db)
+    formatted = [
+        format_invoice_response(
+            inv, st, can_delete=can_delete_with_tips(inv, tips)
+        )
+        for inv in invoices
+    ]
     if status_filter and status_filter != "all":
         formatted = [inv for inv in formatted if inv.status == status_filter]
 
@@ -407,7 +693,31 @@ async def get_invoice(
     _assert_invoice_access(inv, current_user)
 
     st = await _load_settings(db)
-    return format_invoice_response(inv, st)
+    from ..services.invoice_snapshot import ensure_issued_snapshot
+
+    # Paid missing freeze → freeze; unpaid with stale freeze → clear.
+    before_snap = getattr(inv, "document_snapshot", None)
+    ensure_issued_snapshot(
+        inv,
+        client=inv.client,
+        settings=st,
+        project=inv.project,
+        parent_invoice=_loaded_parent_invoice(inv),
+    )
+    if before_snap is not getattr(inv, "document_snapshot", None):
+        await db.commit()
+        await db.refresh(inv)
+    from ..services.invoice_numbers import can_delete_invoice
+
+    can_gst, toggle_preview = await _gst_toggle_response_fields(db, inv, st)
+    can_del = await can_delete_invoice(db, inv)
+    return format_invoice_response(
+        inv,
+        st,
+        can_change_gst=can_gst,
+        gst_toggle_preview_number=toggle_preview,
+        can_delete=can_del,
+    )
 
 @router.post("", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
 async def create_invoice(
@@ -440,9 +750,35 @@ async def create_invoice(
 
     # Calculate subtotal from items; GST only when enabled in Settings
     subtotal_paise = sum(int(round(float(item.quantity) * item.unit_rate_paise)) for item in payload.items)
-    tax_rate = effective_tax_rate(st, payload.tax_rate_percent)
-    tax_paise = compute_tax_paise(subtotal_paise, tax_rate)
-    total_paise = subtotal_paise + tax_paise
+    from ..models import Client as ClientModel
+
+    client_row = (
+        await db.execute(select(ClientModel).where(ClientModel.id == payload.client_id))
+    ).scalars().first()
+    from ..services.gst_registrations import resolve_settings_for_invoice
+
+    tax_settings, gst_reg = await resolve_settings_for_invoice(
+        db, st, client=client_row, issue_date=payload.issue_date
+    )
+    # None = follow Settings; False forces a non-GST invoice.
+    inv_gst = payload.gst_enabled
+    settings_gst = gst_is_enabled(tax_settings) if tax_settings else False
+    effective_gst = settings_gst if inv_gst is None else bool(inv_gst)
+    tax_rate_in = float(payload.tax_rate_percent or 0) if effective_gst else 0.0
+    tax_snap = apply_invoice_tax_snapshot(
+        settings=tax_settings,
+        client=client_row,
+        subtotal_paise=subtotal_paise,
+        tax_rate_percent=tax_rate_in,
+        discount_paise=payload.discount_paise or 0,
+    )
+    tax_rate = float(tax_snap["tax_rate_percent"]) if effective_gst else 0.0
+    tax_paise = int(tax_snap["tax_paise"]) if effective_gst else 0
+    total_paise = (
+        (int(tax_snap["total_paise"]) + int(tax_snap.get("round_off_paise", 0) or 0))
+        if effective_gst
+        else max(0, subtotal_paise - int(payload.discount_paise or 0))
+    )
 
     initial_status = (payload.status or "draft").strip().lower()
     if initial_status not in ("draft", "sent", "paid", "overdue"):
@@ -464,6 +800,16 @@ async def create_invoice(
         tax_rate_percent=tax_rate,
         tax_paise=tax_paise,
         total_paise=total_paise,
+        gst_enabled=inv_gst,
+        place_of_supply=tax_snap.get("place_of_supply") if effective_gst else None,
+        supply_type=tax_snap.get("supply_type") if effective_gst else None,
+        cgst_paise=int(tax_snap.get("cgst_paise") or 0) if effective_gst else 0,
+        sgst_paise=int(tax_snap.get("sgst_paise") or 0) if effective_gst else 0,
+        igst_paise=int(tax_snap.get("igst_paise") or 0) if effective_gst else 0,
+        discount_paise=int(payload.discount_paise or 0),
+        round_off_paise=0,
+        amount_paid_paise=total_paise if initial_status == "paid" else 0,
+        po_number=(payload.po_number or None),
         notes=payload.notes,
         upi_id_override=(payload.upi_id_override or None),
         upi_qr_url=(payload.upi_qr_url or None),
@@ -480,10 +826,12 @@ async def create_invoice(
             invoice_type=number_hint,
             issue_date=payload.issue_date,
             settings_row=st,
+            gst_enabled=effective_gst,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
+    default_sac = (getattr(st, "default_sac_code", None) or "").strip() or None
     for item in payload.items:
         amt = int(round(float(item.quantity) * item.unit_rate_paise))
         db.add(InvoiceItem(
@@ -493,10 +841,29 @@ async def create_invoice(
             unit_rate_paise=item.unit_rate_paise,
             amount_paise=amt,
             line_kind=normalize_line_kind(item.line_kind, raw_type if raw_type != "mixed" else "custom_dev"),
+            hsn_sac=(None if not effective_gst else (item.hsn_sac or default_sac)),
+            unit=(item.unit or None),
         ))
 
     if (raw_type in ("amc", "mixed")) and payload.project_id and payload.covers_to:
         await _hold_maintenance_emails(db, payload.project_id, payload.covers_to)
+
+    # Freeze only when created already paid. Unpaid (draft/sent/overdue) stays live.
+    if initial_status == "paid":
+        from ..services.invoice_snapshot import freeze_document_snapshot
+        from ..models import Project as ProjectModel
+
+        project_row = (
+            await db.execute(select(ProjectModel).where(ProjectModel.id == payload.project_id))
+        ).scalars().first()
+        freeze_document_snapshot(
+            invoice,
+            client=client_row,
+            settings=st,
+            project=project_row,
+            gst_registration=gst_reg,
+            force=True,
+        )
 
     await write_audit(
         db,
@@ -512,12 +879,27 @@ async def create_invoice(
     # Re-fetch with loaded items
     stmt = (
         select(Invoice)
-        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .options(
+            selectinload(Invoice.client),
+            selectinload(Invoice.project),
+            selectinload(Invoice.items),
+            selectinload(Invoice.payments),
+        )
         .where(Invoice.id == invoice.id)
     )
     res = await db.execute(stmt)
     created_inv = res.scalars().first()
-    return format_invoice_response(created_inv, st)
+    from ..services.invoice_numbers import can_delete_invoice
+
+    can_gst, toggle_preview = await _gst_toggle_response_fields(db, created_inv, st)
+    can_del = await can_delete_invoice(db, created_inv) if created_inv else False
+    return format_invoice_response(
+        created_inv,
+        st,
+        can_change_gst=can_gst,
+        gst_toggle_preview_number=toggle_preview,
+        can_delete=can_del,
+    )
 
 @router.post("/{invoice_id}/cancel", response_model=InvoiceResponse)
 async def cancel_invoice(
@@ -537,13 +919,24 @@ async def cancel_invoice(
     before = {"status": inv.status}
     assert_can_cancel(inv)
     apply_status(inv, "cancelled")
+    # Cancelled = permanent freeze (same as paid): number + details locked.
+    st = await _load_settings(db)
+    from ..services.invoice_snapshot import freeze_document_snapshot
+
+    freeze_document_snapshot(
+        inv,
+        client=inv.client,
+        settings=st,
+        project=inv.project,
+        parent_invoice=_loaded_parent_invoice(inv),
+        force=True,
+    )
     await write_audit(
         db, current_user, "invoices", inv.id, "cancel", before=before, after={"status": inv.status}, request=request
     )
     await db.commit()
     await db.refresh(inv)
-    st = await _load_settings(db)
-    return format_invoice_response(inv, st)
+    return format_invoice_response(inv, st, can_change_gst=False, can_delete=False)
 
 
 @router.post("/{invoice_id}/credit-note", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
@@ -584,14 +977,27 @@ async def create_credit_note(
     if credit_sub <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Credit amount must be greater than zero")
 
-    tax_rate = effective_tax_rate(st, float(parent.tax_rate_percent or 0))
-    tax_paise = compute_tax_paise(credit_sub, tax_rate)
-    total_paise = credit_sub + tax_paise
-
-    from ..services.invoice_numbers import assign_unique_invoice_number
-    from ..services.project_money import ledger_for
+    from ..services.gst_registrations import resolve_settings_for_invoice
 
     today = date.today()
+    tax_settings, gst_reg = await resolve_settings_for_invoice(
+        db, st, client=parent.client, issue_date=today
+    )
+    tax_snap = apply_invoice_tax_snapshot(
+        settings=tax_settings,
+        client=parent.client,
+        subtotal_paise=credit_sub,
+        tax_rate_percent=float(parent.tax_rate_percent or 0),
+        discount_paise=0,
+    )
+    tax_rate = float(tax_snap["tax_rate_percent"])
+    tax_paise = int(tax_snap["tax_paise"])
+    total_paise = int(tax_snap["total_paise"])
+
+    from ..services.invoice_numbers import assign_unique_invoice_number
+    from ..services.invoice_snapshot import freeze_document_snapshot
+    from ..services.project_money import ledger_for
+
     reason = (payload.reason or "").strip()
     notes = f"Credit note for {parent.invoice_number}"
     if reason:
@@ -613,10 +1019,17 @@ async def create_credit_note(
         tax_rate_percent=tax_rate,
         tax_paise=tax_paise,
         total_paise=total_paise,
+        place_of_supply=tax_snap.get("place_of_supply"),
+        supply_type=tax_snap.get("supply_type"),
+        cgst_paise=int(tax_snap.get("cgst_paise") or 0),
+        sgst_paise=int(tax_snap.get("sgst_paise") or 0),
+        igst_paise=int(tax_snap.get("igst_paise") or 0),
+        amount_paid_paise=total_paise if cn_status == "paid" else 0,
         notes=notes,
         paid_at=datetime.now(timezone.utc) if cn_status == "paid" else None,
         upi_id_override=parent.upi_id_override,
         upi_qr_url=parent.upi_qr_url,
+        gst_enabled=getattr(parent, "gst_enabled", None),
     )
     try:
         await assign_unique_invoice_number(
@@ -637,6 +1050,14 @@ async def create_credit_note(
             amount_paise=credit_sub,
         )
     )
+    freeze_document_snapshot(
+        credit,
+        client=parent.client,
+        settings=st,
+        project=parent.project,
+        parent_invoice=parent,
+        gst_registration=gst_reg,
+    )
     await db.commit()
 
     ref = (
@@ -644,6 +1065,133 @@ async def create_credit_note(
             select(Invoice)
             .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
             .where(Invoice.id == credit.id)
+        )
+    ).scalars().first()
+    return format_invoice_response(ref, st)
+
+
+@router.post("/{invoice_id}/debit-note", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
+async def create_debit_note(
+    invoice_id: str,
+    payload: DebitNoteCreate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_founder_ceo),
+):
+    """Issue a debit note (additional charge) referencing a parent invoice."""
+    stmt = (
+        select(Invoice)
+        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
+    parent = (await db.execute(stmt)).scalars().first()
+    if not parent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+    if parent.status in ("cancelled", "void", "draft"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debit notes can only be issued against sent, overdue, or paid invoices",
+        )
+    if parent.invoice_type in ("credit_note", "debit_note"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot debit a credit/debit note",
+        )
+
+    settings_stmt = select(Settings).where(Settings.id == "default").with_for_update()
+    st = (await db.execute(settings_stmt)).scalar_one_or_none()
+    if not st:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Settings record not found")
+
+    debit_sub = max(0, int(payload.amount_paise or 0))
+    if debit_sub <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Debit amount must be greater than zero")
+
+    from ..services.gst_registrations import resolve_settings_for_invoice
+
+    today = date.today()
+    tax_settings, gst_reg = await resolve_settings_for_invoice(
+        db, st, client=parent.client, issue_date=today
+    )
+    tax_snap = apply_invoice_tax_snapshot(
+        settings=tax_settings,
+        client=parent.client,
+        subtotal_paise=debit_sub,
+        tax_rate_percent=float(parent.tax_rate_percent or 0),
+        discount_paise=0,
+    )
+    tax_rate = float(tax_snap["tax_rate_percent"])
+    tax_paise = int(tax_snap["tax_paise"])
+    total_paise = int(tax_snap["total_paise"])
+
+    from ..services.invoice_numbers import assign_unique_invoice_number
+    from ..services.invoice_snapshot import freeze_document_snapshot
+    from ..services.project_money import ledger_for
+
+    reason = (payload.reason or "").strip()
+    notes = f"Debit note for {parent.invoice_number}"
+    if reason:
+        notes = f"{notes}. {reason}"
+    line_desc = (payload.description or "").strip() or f"Additional charge on {parent.invoice_number}"
+
+    debit = Invoice(
+        invoice_number="",
+        invoice_type="debit_note",
+        ledger=ledger_for(parent.invoice_type or "custom_dev"),
+        client_id=parent.client_id,
+        project_id=parent.project_id,
+        parent_invoice_id=parent.id,
+        status="sent",
+        issue_date=today,
+        due_date=today,
+        subtotal_paise=debit_sub,
+        tax_rate_percent=tax_rate,
+        tax_paise=tax_paise,
+        total_paise=total_paise,
+        place_of_supply=tax_snap.get("place_of_supply"),
+        supply_type=tax_snap.get("supply_type"),
+        cgst_paise=int(tax_snap.get("cgst_paise") or 0),
+        sgst_paise=int(tax_snap.get("sgst_paise") or 0),
+        igst_paise=int(tax_snap.get("igst_paise") or 0),
+        amount_paid_paise=0,
+        notes=notes,
+        upi_id_override=parent.upi_id_override,
+        upi_qr_url=parent.upi_qr_url,
+        gst_enabled=getattr(parent, "gst_enabled", None),
+    )
+    try:
+        await assign_unique_invoice_number(
+            db,
+            debit,
+            invoice_type="debit_note",
+            issue_date=today,
+            settings_row=st,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+    db.add(
+        InvoiceItem(
+            invoice_id=debit.id,
+            description=line_desc,
+            quantity=1,
+            unit_rate_paise=debit_sub,
+            amount_paise=debit_sub,
+        )
+    )
+    freeze_document_snapshot(
+        debit,
+        client=parent.client,
+        settings=st,
+        project=parent.project,
+        parent_invoice=parent,
+        gst_registration=gst_reg,
+    )
+    await db.commit()
+
+    ref = (
+        await db.execute(
+            select(Invoice)
+            .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+            .where(Invoice.id == debit.id)
         )
     ).scalars().first()
     return format_invoice_response(ref, st)
@@ -659,11 +1207,19 @@ async def update_invoice(
 ):
     from ..models import InvoiceAuditLog
 
-    stmt = select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id, not_deleted(Invoice))
+    stmt = (
+        select(Invoice)
+        .options(
+            selectinload(Invoice.items),
+            selectinload(Invoice.payments),
+            selectinload(Invoice.client),
+            selectinload(Invoice.project),
+        )
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
-    assert_editable(inv.status)
 
     old_subtotal = int(inv.subtotal_paise or 0)
     was_sent = inv.status in ("sent", "overdue")
@@ -681,11 +1237,13 @@ async def update_invoice(
         )
     new_items = update_dict.pop("items", None)
 
+    _SOFT_PATCH = {"notes", "due_date", "upi_id_override", "upi_qr_url"}
     _ALLOWED_INVOICE_PATCH = {
         "invoice_type",
         "issue_date",
         "due_date",
         "tax_rate_percent",
+        "gst_enabled",
         "notes",
         "status",
         "upi_id_override",
@@ -694,7 +1252,90 @@ async def update_invoice(
         "covers_from",
         "covers_to",
         "monthly_rate_paise",
+        "discount_paise",
+        "po_number",
     }
+    hard_keys = set(update_dict.keys()) - _SOFT_PATCH
+    content_change = bool(hard_keys) or new_items is not None
+    if content_change:
+        assert_content_editable(inv.status)
+    else:
+        assert_soft_editable(inv.status)
+
+    gst_flag_changing = "gst_enabled" in update_dict
+    st = await _load_settings(db)
+
+    # GST series switch: archive → hard-delete → new number on other series.
+    if gst_flag_changing and content_change:
+        from ..services.invoice_numbers import (
+            GST_TOGGLE_BLOCKED_TIP,
+            can_delete_invoice,
+            parse_series_key,
+        )
+        from ..services.gst_series_switch import (
+            reload_invoice_detail,
+            switch_invoice_gst_series,
+        )
+
+        target_gst = bool(update_dict.get("gst_enabled"))
+        # Treat explicit null as follow-settings
+        if update_dict.get("gst_enabled") is None:
+            target_gst = bool(getattr(st, "gst_enabled", False))
+        parsed = parse_series_key(inv.invoice_number)
+        series_would_change = (
+            parsed is not None and bool(parsed["gst_enabled"]) != bool(target_gst)
+        )
+        if series_would_change:
+            try:
+                new_inv = await switch_invoice_gst_series(
+                    db,
+                    inv,
+                    target_gst_enabled=target_gst,
+                    settings_row=st,
+                    update_fields=update_dict,
+                    new_items=new_items,
+                    deleted_by=current_user,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(exc) or GST_TOGGLE_BLOCKED_TIP,
+                ) from exc
+
+            await write_audit(
+                db,
+                current_user,
+                "invoices",
+                new_inv.id,
+                "gst_series_switch",
+                before=before,
+                after=snapshot_entity(
+                    new_inv,
+                    [
+                        "invoice_number",
+                        "status",
+                        "gst_enabled",
+                        "tax_rate_percent",
+                        "subtotal_paise",
+                        "total_paise",
+                    ],
+                ),
+                request=request,
+            )
+            await db.commit()
+            refreshed = await reload_invoice_detail(db, new_inv.id)
+            can_gst, toggle_preview = await _gst_toggle_response_fields(
+                db, refreshed or new_inv, st
+            )
+            can_del = await can_delete_invoice(db, refreshed or new_inv)
+            return format_invoice_response(
+                refreshed or new_inv,
+                st,
+                can_change_gst=can_gst,
+                gst_toggle_preview_number=toggle_preview,
+                can_delete=can_del,
+            )
+
     for k, v in update_dict.items():
         if k not in _ALLOWED_INVOICE_PATCH:
             raise HTTPException(
@@ -705,6 +1346,18 @@ async def update_invoice(
 
     if requested_status is not None:
         apply_status(inv, requested_status)
+        # Freeze only when becoming paid (or cancel/void). Unpaid stays live.
+        if requested_status in ("paid", "cancelled", "void"):
+            from ..services.invoice_snapshot import freeze_document_snapshot
+
+            freeze_document_snapshot(
+                inv,
+                client=inv.client,
+                settings=st,
+                project=inv.project,
+                parent_invoice=_loaded_parent_invoice(inv),
+                force=True,
+            )
 
     if new_items is not None:
         from ..services.invoice_typing import normalize_line_kind, resolve_invoice_typing
@@ -730,6 +1383,12 @@ async def update_invoice(
                     item_data.get("line_kind"),
                     inv.invoice_type or "custom_dev",
                 ),
+                hsn_sac=(
+                    None
+                    if inv.gst_enabled is False
+                    else (item_data.get("hsn_sac") or None)
+                ),
+                unit=(item_data.get("unit") or None),
             ))
         inv.subtotal_paise = subtotal_paise
         header_type, header_ledger, _ = resolve_invoice_typing(
@@ -739,12 +1398,46 @@ async def update_invoice(
         inv.invoice_type = header_type
         inv.ledger = header_ledger
 
-    st = await _load_settings(db)
-    if "tax_rate_percent" in update_dict or new_items is not None:
-        tax_rate = effective_tax_rate(st, float(inv.tax_rate_percent or 0))
-        inv.tax_rate_percent = tax_rate
-        inv.tax_paise = compute_tax_paise(int(inv.subtotal_paise or 0), tax_rate)
-        inv.total_paise = int(inv.subtotal_paise or 0) + inv.tax_paise
+    # Resolve effective GST for tax math (override or Settings).
+    if inv.gst_enabled is False:
+        inv.tax_rate_percent = 0
+        inv.tax_paise = 0
+        inv.cgst_paise = 0
+        inv.sgst_paise = 0
+        inv.igst_paise = 0
+        inv.place_of_supply = None
+        inv.supply_type = None
+        inv.total_paise = max(
+            0,
+            int(inv.subtotal_paise or 0) - int(getattr(inv, "discount_paise", 0) or 0),
+        )
+        if new_items is None:
+            for it in inv.items or []:
+                it.hsn_sac = None
+    elif (
+        "tax_rate_percent" in update_dict
+        or new_items is not None
+        or "discount_paise" in update_dict
+        or "gst_enabled" in update_dict
+    ):
+        # Ensure client is available for place-of-supply / GST split
+        if "client" in sa_inspect(inv).unloaded:
+            await db.refresh(inv, attribute_names=["client"])
+        tax_snap = apply_invoice_tax_snapshot(
+            settings=st,
+            client=inv.client,
+            subtotal_paise=int(inv.subtotal_paise or 0),
+            tax_rate_percent=float(inv.tax_rate_percent or 0),
+            discount_paise=int(getattr(inv, "discount_paise", 0) or 0),
+        )
+        inv.tax_rate_percent = float(tax_snap["tax_rate_percent"])
+        inv.tax_paise = int(tax_snap["tax_paise"])
+        inv.total_paise = int(tax_snap["total_paise"])
+        inv.place_of_supply = tax_snap.get("place_of_supply")
+        inv.supply_type = tax_snap.get("supply_type")
+        inv.cgst_paise = int(tax_snap.get("cgst_paise") or 0)
+        inv.sgst_paise = int(tax_snap.get("sgst_paise") or 0)
+        inv.igst_paise = int(tax_snap.get("igst_paise") or 0)
 
     if inv.invoice_type in ("maintenance", "amc"):
         inv.invoice_type = "amc"
@@ -787,31 +1480,89 @@ async def update_invoice(
     )
     res = await db.execute(stmt)
     updated_inv = res.scalars().first()
-    return format_invoice_response(updated_inv, st)
+    from ..services.invoice_numbers import can_delete_invoice
+
+    can_gst, toggle_preview = await _gst_toggle_response_fields(db, updated_inv, st)
+    can_del = await can_delete_invoice(db, updated_inv) if updated_inv else False
+    return format_invoice_response(
+        updated_inv,
+        st,
+        can_change_gst=can_gst,
+        gst_toggle_preview_number=toggle_preview,
+        can_delete=can_del,
+    )
 
 @router.delete("/{invoice_id}", status_code=status.HTTP_200_OK)
 async def delete_invoice(
     invoice_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_founder_ceo)
+    current_user: User = Depends(require_founder_ceo),
 ):
-    stmt = select(Invoice).where(Invoice.id == invoice_id, not_deleted(Invoice))
+    from ..services.deleted_invoice_archive import (
+        DELETED_INVOICE_LOAD_OPTIONS,
+        archive_deleted_invoice,
+    )
+    from ..services.gst_series_switch import hard_delete_invoice_completely
+    from ..services.invoice_numbers import reclaim_sequence_if_tip
+
+    stmt = (
+        select(Invoice)
+        .options(*DELETED_INVOICE_LOAD_OPTIONS)
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
     inv = (await db.execute(stmt)).scalars().first()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
 
-    assert_deletable(inv.status)
+    from ..services.invoice_numbers import assert_can_delete_invoice
 
-    inv.soft_delete()
+    await assert_can_delete_invoice(db, inv)
+
+    # Archive for founder/admin DB reference, then permanently delete + free the number.
+    archive_deleted_invoice(
+        db, inv, deleted_by=current_user, deleted_reason="user_delete"
+    )
+    await db.flush()
+
+    st = await _load_settings(db)
+    st_locked = (
+        await db.execute(
+            select(Settings).where(Settings.id == "default").with_for_update()
+        )
+    ).scalar_one_or_none() or st
+    old_number = await hard_delete_invoice_completely(db, inv)
+    if st_locked:
+        reclaim_sequence_if_tip(st_locked, old_number)
     await db.commit()
-    return {"message": "Invoice deleted successfully"}
+    return {
+        "message": "Invoice permanently deleted",
+        "revoked_invoice_number": old_number,
+    }
 
 @router.get("/{invoice_id}/pdf")
 async def download_invoice_pdf(
     invoice_id: str,
+    paper_size: Optional[str] = Query(
+        None,
+        description="Page size: a3, a4, a5, a6, letter, legal, tabloid, executive, b4, b5",
+    ),
+    orientation: Optional[str] = Query(
+        "portrait",
+        description="Page orientation: portrait or landscape (applies to all paper sizes).",
+    ),
+    download: bool = Query(
+        True,
+        description="If true, Content-Disposition is attachment (save as invoice number).",
+    ),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
+    from ..services.file_mime import (
+        attachment_content_disposition,
+        inline_content_disposition,
+    )
+    from ..services.pdf import PAPER_SIZES, resolve_paper_size
+
     stmt = (
         select(Invoice)
         .options(*_invoice_eager_options(include_parent=True))
@@ -823,8 +1574,46 @@ async def download_invoice_pdf(
 
     _assert_invoice_access(inv, current_user)
 
+    orient_raw = (orientation or "portrait").strip().lower().replace(" ", "_")
+    if orient_raw not in {"portrait", "landscape", "l", "horizontal", "p", "vertical"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported orientation. Use portrait or landscape.",
+        )
+
+    if paper_size is not None and str(paper_size).strip():
+        raw = str(paper_size).strip().lower().replace(" ", "_")
+        resolved_key, _ = resolve_paper_size(raw, orient_raw)
+        # Reject unknown values (resolve falls back to a4 for garbage).
+        known = set(PAPER_SIZES) | {
+            "us_letter",
+            "us-letter",
+            "us_legal",
+            "us-legal",
+            "ledger",
+            "11x17",
+        }
+        if raw not in known and resolved_key == "a4" and raw != "a4":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported paper_size. Use one of: {', '.join(sorted(PAPER_SIZES))}",
+            )
+
     st_res = await db.execute(select(Settings).where(Settings.id == "default"))
     settings_obj = st_res.scalars().first()
+
+    from ..services.invoice_snapshot import ensure_issued_snapshot
+
+    before_snap = getattr(inv, "document_snapshot", None)
+    ensure_issued_snapshot(
+        inv,
+        client=inv.client,
+        settings=settings_obj,
+        project=inv.project,
+        parent_invoice=_loaded_parent_invoice(inv),
+    )
+    if before_snap is not getattr(inv, "document_snapshot", None):
+        await db.commit()
 
     pdf_bytes = generate_invoice_pdf(
         invoice=inv,
@@ -833,15 +1622,27 @@ async def download_invoice_pdf(
         items=inv.items,
         project=inv.project,
         parent_invoice=_loaded_parent_invoice(inv),
+        paper_size=paper_size,
+        orientation=orient_raw,
     )
 
-    filename = f"{inv.invoice_number}.pdf"
+    raw_number = (inv.invoice_number or invoice_id).strip()
+    safe_number = "".join(
+        ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in raw_number
+    ) or "invoice"
+    filename = f"{safe_number}.pdf"
+    disposition = (
+        attachment_content_disposition(filename)
+        if download
+        else inline_content_disposition(filename)
+    )
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'inline; filename="{filename}"'
-        }
+            "Content-Disposition": disposition,
+            "Content-Length": str(len(pdf_bytes)),
+        },
     )
 
 @router.post("/{invoice_id}/send")
@@ -860,14 +1661,31 @@ async def send_invoice_email(
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
 
-    if not inv.client or not inv.client.email:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client has no email address")
+    if not inv.client or not (inv.client.email or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Client company has no email address",
+        )
     assert_can_send(inv)
 
     st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
 
     if not st or not st.smtp_host:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="SMTP is not configured in settings")
+
+    from ..services.invoice_snapshot import (
+        company_branding_from_snapshot,
+        document_details_are_locked,
+        get_snapshot,
+    )
+    from ..services.gst_registrations import resolve_settings_for_invoice
+    from ..services.email_html import compose_invoice_client_email
+    from ..services.invoice_mail import invoice_mail_targets
+
+    _tax_settings, gst_reg = await resolve_settings_for_invoice(
+        db, st, client=inv.client, issue_date=inv.issue_date
+    )
+    # Unpaid send uses live company/client — freeze only happens on paid.
 
     pdf_bytes = generate_invoice_pdf(
         invoice=inv,
@@ -878,14 +1696,23 @@ async def send_invoice_email(
         parent_invoice=_loaded_parent_invoice(inv),
     )
 
-    from ..services.email_html import compose_invoice_client_email
-
+    locked = document_details_are_locked(inv)
+    brand = company_branding_from_snapshot(
+        get_snapshot(inv), st, prefer_live=not locked
+    )
+    snap = get_snapshot(inv) or {}
+    snap_company = snap.get("company") if isinstance(snap.get("company"), dict) else {}
+    to_email, cc_email = invoice_mail_targets(inv.client, st)
     kind, subject, html, plain, attachment_name = compose_invoice_client_email(
-        company_name=st.company_name,
-        company_address=st.company_address or "",
-        company_gstin=st.company_gstin or "",
-        company_logo_url=st.company_logo_url or "/brand/krws-mark.png",
-        client_name=inv.client.primary_contact_name or inv.client.name,
+        company_name=brand["company_name"] or st.company_name,
+        company_address=brand["company_address"] or "",
+        company_gstin=brand["company_gstin"] or "",
+        company_logo_url=(
+            (snap_company.get("logo_url") if locked and snap_company else None)
+            or st.company_logo_url
+            or "/brand/krws-mark.png"
+        ),
+        client_name=inv.client.name,
         invoice_number=inv.invoice_number,
         total_paise=inv.total_paise,
         due_date=inv.due_date,
@@ -900,7 +1727,7 @@ async def send_invoice_email(
 
     try:
         await send_email_async(
-            to_email=inv.client.email,
+            to_email=to_email,
             subject=subject,
             body=html,
             plain_body=plain,
@@ -908,7 +1735,7 @@ async def send_invoice_email(
             attachment_bytes=pdf_bytes,
             attachment_filename=attachment_name,
             is_html=True,
-            cc_email=st.invoice_cc_email,
+            cc_email=cc_email,
         )
     except Exception as e:
         inv.email_status = "failed"
@@ -945,10 +1772,293 @@ async def send_invoice_email(
         "sent": "invoice",
         "reminder": "payment reminder",
     }.get(kind, "invoice")
+    msg = f"{kind_label.capitalize()} for {inv.invoice_number} sent to {to_email}"
+    if cc_email:
+        msg += f" (CC: {cc_email})"
     return {
-        "message": f"{kind_label.capitalize()} for {inv.invoice_number} sent to {inv.client.email}",
+        "message": msg,
         "email_kind": kind,
     }
+
+@router.get("/{invoice_id}/payments", response_model=List[InvoicePaymentResponse])
+async def list_invoice_payments(
+    invoice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role == "worker":
+        raise HTTPException(status_code=403, detail="Workers cannot view invoices")
+    stmt = (
+        select(Invoice)
+        .options(selectinload(Invoice.payments), selectinload(Invoice.client))
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
+    inv = (await db.execute(stmt)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    _assert_invoice_access(inv, current_user)
+    out: List[InvoicePaymentResponse] = []
+    for p in inv.payments or []:
+        if getattr(p, "deleted_at", None):
+            continue
+        out.append(
+            InvoicePaymentResponse(
+                id=p.id,
+                amount_paise=int(p.amount_paise or 0),
+                method=p.method,
+                reference=p.reference,
+                paid_at=p.paid_at,
+                note=p.note,
+                status=getattr(p, "status", None) or "verified",
+                rejection_reason=getattr(p, "rejection_reason", None),
+                recorded_by=p.recorded_by,
+                verified_by=getattr(p, "verified_by", None),
+                verified_at=getattr(p, "verified_at", None),
+                rejected_by=getattr(p, "rejected_by", None),
+                rejected_at=getattr(p, "rejected_at", None),
+                has_proof=bool(getattr(p, "proof_object_key", None)),
+            )
+        )
+    return out
+
+
+@router.post("/{invoice_id}/payments", response_model=InvoiceResponse)
+async def create_invoice_payment(
+    invoice_id: str,
+    payload: InvoicePaymentCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    stmt = (
+        select(Invoice)
+        .options(
+            selectinload(Invoice.client),
+            selectinload(Invoice.project),
+            selectinload(Invoice.items),
+            selectinload(Invoice.payments),
+        )
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
+    inv = (await db.execute(stmt)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    assert_payment_mutable(inv)
+    await assert_unique_reference(db, invoice_id=inv.id, reference=payload.reference)
+
+    now = payload.paid_at or datetime.now(timezone.utc)
+    status_val = "verified" if payload.mark_verified else "pending"
+    pay = InvoicePayment(
+        invoice_id=inv.id,
+        amount_paise=int(payload.amount_paise),
+        method=payload.method or "bank_transfer",
+        reference=(payload.reference or "").strip() or None,
+        note=(payload.note or "").strip() or None,
+        recorded_by=current_user.id,
+        paid_at=now,
+        status=status_val,
+        verified_by=current_user.id if status_val == "verified" else None,
+        verified_at=now if status_val == "verified" else None,
+    )
+    db.add(pay)
+    await db.flush()
+    await recalc_amount_paid(db, inv)
+    newly_paid = maybe_mark_invoice_paid(inv, actor_id=current_user.id)
+    if newly_paid:
+        st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+        if st:
+            from ..services.invoice_snapshot import freeze_document_snapshot
+
+            freeze_document_snapshot(
+                inv,
+                client=inv.client,
+                settings=st,
+                project=inv.project,
+                parent_invoice=_loaded_parent_invoice(inv),
+                force=True,
+            )
+        if inv.ledger == "maintenance" and inv.project_id and inv.covers_to:
+            await _hold_maintenance_emails(db, inv.project_id, inv.covers_to)
+
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "create_payment",
+        after={
+            "payment_id": pay.id,
+            "amount_paise": pay.amount_paise,
+            "status": pay.status,
+            "invoice_status": inv.status,
+        },
+        request=request,
+    )
+    await db.commit()
+    refreshed = (
+        await db.execute(
+            select(Invoice)
+            .options(*_invoice_eager_options())
+            .where(Invoice.id == invoice_id, not_deleted(Invoice))
+        )
+    ).scalars().first()
+    st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+    return format_invoice_response(refreshed or inv, st)
+
+
+@router.post("/{invoice_id}/payments/{payment_id}/verify", response_model=InvoiceResponse)
+async def verify_invoice_payment(
+    invoice_id: str,
+    payment_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    stmt = (
+        select(Invoice)
+        .options(
+            selectinload(Invoice.client),
+            selectinload(Invoice.project),
+            selectinload(Invoice.items),
+            selectinload(Invoice.payments),
+        )
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
+    inv = (await db.execute(stmt)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    pay = next((p for p in (inv.payments or []) if p.id == payment_id and not p.deleted_at), None)
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if pay.status == "verified":
+        st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+        return format_invoice_response(inv, st)
+    if pay.status == "rejected":
+        raise HTTPException(status_code=400, detail="Cannot verify a rejected payment")
+
+    now = datetime.now(timezone.utc)
+    pay.status = "verified"
+    pay.verified_by = current_user.id
+    pay.verified_at = now
+    await recalc_amount_paid(db, inv)
+    newly_paid = maybe_mark_invoice_paid(inv, actor_id=current_user.id)
+    if newly_paid:
+        st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+        if st:
+            from ..services.invoice_snapshot import freeze_document_snapshot
+
+            freeze_document_snapshot(
+                inv,
+                client=inv.client,
+                settings=st,
+                project=inv.project,
+                parent_invoice=_loaded_parent_invoice(inv),
+                force=True,
+            )
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "verify_payment_row",
+        after={"payment_id": pay.id, "invoice_status": inv.status},
+        request=request,
+    )
+    await db.commit()
+    refreshed = (
+        await db.execute(
+            select(Invoice)
+            .options(*_invoice_eager_options())
+            .where(Invoice.id == invoice_id, not_deleted(Invoice))
+        )
+    ).scalars().first()
+    st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+    return format_invoice_response(refreshed or inv, st)
+
+
+@router.post("/{invoice_id}/payments/{payment_id}/reject", response_model=InvoiceResponse)
+async def reject_invoice_payment(
+    invoice_id: str,
+    payment_id: str,
+    payload: InvoicePaymentReject,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    stmt = (
+        select(Invoice)
+        .options(
+            selectinload(Invoice.client),
+            selectinload(Invoice.project),
+            selectinload(Invoice.items),
+            selectinload(Invoice.payments),
+        )
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
+    inv = (await db.execute(stmt)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.status == "paid":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reject payments on a paid invoice; issue a credit note instead",
+        )
+    pay = next((p for p in (inv.payments or []) if p.id == payment_id and not p.deleted_at), None)
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if pay.status == "rejected":
+        st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+        return format_invoice_response(inv, st)
+
+    was_verified = pay.status == "verified"
+    now = datetime.now(timezone.utc)
+    pay.status = "rejected"
+    pay.rejection_reason = payload.reason.strip()
+    pay.rejected_by = current_user.id
+    pay.rejected_at = now
+    pay.verified_by = None
+    pay.verified_at = None
+    if was_verified:
+        await recalc_amount_paid(db, inv)
+
+    # If invoice was awaiting proof and no other pending proofs, return to sent/overdue
+    if inv.status == "proof_pending":
+        still_pending = any(
+            (getattr(p, "status", None) == "pending") and not p.deleted_at
+            for p in (inv.payments or [])
+            if p.id != pay.id
+        )
+        if not still_pending and not inv.payment_proof_object_key:
+            target = "overdue" if inv.due_date and inv.due_date < date.today() else "sent"
+            apply_status(inv, target)
+        elif not still_pending and inv.payment_proof_object_key:
+            # Keep proof_pending if invoice-level proof still awaits — founder should re-verify
+            pass
+
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "reject_payment",
+        after={
+            "payment_id": pay.id,
+            "reason": pay.rejection_reason,
+            "invoice_status": inv.status,
+        },
+        request=request,
+    )
+    await db.commit()
+    refreshed = (
+        await db.execute(
+            select(Invoice)
+            .options(*_invoice_eager_options())
+            .where(Invoice.id == invoice_id, not_deleted(Invoice))
+        )
+    ).scalars().first()
+    st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+    return format_invoice_response(refreshed or inv, st)
+
 
 @router.post("/{invoice_id}/pay", response_model=InvoiceResponse)
 @router.post("/{invoice_id}/mark-paid", response_model=InvoiceResponse)
@@ -972,6 +2082,22 @@ async def mark_invoice_as_paid(
     if inv.status != "paid":
         apply_status(inv, "paid")
         inv.paid_at = datetime.now(timezone.utc)
+        remaining = max(
+            0,
+            int(inv.total_paise or 0) - int(getattr(inv, "amount_paid_paise", 0) or 0),
+        )
+        if remaining > 0:
+            db.add(
+                _record_invoice_payment(
+                    inv=inv,
+                    amount_paise=remaining,
+                    method="bank_transfer",
+                    reference=None,
+                    note="Marked paid (no proof)",
+                    recorded_by=current_user.id,
+                    paid_at=inv.paid_at,
+                )
+            )
     if inv.ledger == "maintenance" and inv.project_id and inv.covers_to:
         await _hold_maintenance_emails(db, inv.project_id, inv.covers_to)
 
@@ -986,6 +2112,20 @@ async def mark_invoice_as_paid(
         act.decided_by = current_user.id
         act.decided_at = datetime.now(timezone.utc)
 
+    st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+    if st:
+        from ..services.invoice_snapshot import freeze_document_snapshot
+
+        # Freeze current company / client / payment at the moment of payment.
+        freeze_document_snapshot(
+            inv,
+            client=inv.client,
+            settings=st,
+            project=inv.project,
+            parent_invoice=_loaded_parent_invoice(inv),
+            force=True,
+        )
+
     await write_audit(
         db,
         current_user,
@@ -997,11 +2137,16 @@ async def mark_invoice_as_paid(
         request=request,
     )
     await db.commit()
-    await db.refresh(inv)
 
-    st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
-    await _send_paid_receipt_email(db, inv, st)
-    return format_invoice_response(inv, st)
+    refreshed = (
+        await db.execute(
+            select(Invoice)
+            .options(*_invoice_eager_options())
+            .where(Invoice.id == invoice_id, not_deleted(Invoice))
+        )
+    ).scalars().first()
+    await _send_paid_receipt_email(db, refreshed or inv, st)
+    return format_invoice_response(refreshed or inv, st)
 
 
 @router.post("/{invoice_id}/payment-proof", response_model=InvoiceResponse)
@@ -1108,6 +2253,54 @@ async def download_payment_proof(
     )
 
 
+@router.post("/{invoice_id}/reject-payment-proof", response_model=InvoiceResponse)
+async def reject_payment_proof(
+    invoice_id: str,
+    payload: InvoicePaymentReject,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    """Reject invoice-level payment proof; preserve file + note history on the invoice."""
+    stmt = (
+        select(Invoice)
+        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
+        .where(Invoice.id == invoice_id, not_deleted(Invoice))
+    )
+    inv = (await db.execute(stmt)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.status != "proof_pending":
+        raise HTTPException(status_code=400, detail="Invoice is not awaiting payment verification")
+    if not inv.payment_proof_object_key:
+        raise HTTPException(status_code=400, detail="No payment proof to reject")
+
+    before = {"status": inv.status, "payment_proof_note": inv.payment_proof_note}
+    reason = payload.reason.strip()
+    prior_note = (inv.payment_proof_note or "").strip()
+    inv.payment_proof_note = (
+        f"[REJECTED] {reason}" + (f" | prior: {prior_note}" if prior_note else "")
+    )
+    inv.payment_verified_at = None
+    inv.payment_verified_by = None
+    target = "overdue" if inv.due_date and inv.due_date < date.today() else "sent"
+    apply_status(inv, target)
+    await write_audit(
+        db,
+        current_user,
+        "invoices",
+        inv.id,
+        "reject_payment_proof",
+        before=before,
+        after={"status": inv.status, "reason": reason},
+        request=request,
+    )
+    await db.commit()
+    await db.refresh(inv)
+    st = await _load_settings(db)
+    return format_invoice_response(inv, st)
+
+
 @router.post("/{invoice_id}/verify-payment", response_model=InvoiceResponse)
 async def verify_payment_and_mark_paid(
     invoice_id: str,
@@ -1131,6 +2324,22 @@ async def verify_payment_and_mark_paid(
     if inv.status != "paid":
         apply_status(inv, "paid")
         inv.paid_at = datetime.now(timezone.utc)
+        remaining = max(
+            0,
+            int(inv.total_paise or 0) - int(getattr(inv, "amount_paid_paise", 0) or 0),
+        )
+        if remaining > 0:
+            db.add(
+                _record_invoice_payment(
+                    inv=inv,
+                    amount_paise=remaining,
+                    method="upi",
+                    reference=None,
+                    note=getattr(inv, "payment_proof_note", None) or "Payment verified",
+                    recorded_by=current_user.id,
+                    paid_at=inv.paid_at,
+                )
+            )
     inv.payment_verified_at = datetime.now(timezone.utc)
     inv.payment_verified_by = current_user.id
 
@@ -1145,6 +2354,19 @@ async def verify_payment_and_mark_paid(
         act.status = "waived"
         act.decided_by = current_user.id
         act.decided_at = datetime.now(timezone.utc)
+
+    st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
+    if st:
+        from ..services.invoice_snapshot import freeze_document_snapshot
+
+        freeze_document_snapshot(
+            inv,
+            client=inv.client,
+            settings=st,
+            project=inv.project,
+            parent_invoice=_loaded_parent_invoice(inv),
+            force=True,
+        )
 
     await write_audit(
         db,
@@ -1163,7 +2385,6 @@ async def verify_payment_and_mark_paid(
     await db.commit()
     await db.refresh(inv)
 
-    st = (await db.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
     await _send_paid_receipt_email(db, inv, st)
     return format_invoice_response(inv, st)
 
@@ -1285,7 +2506,8 @@ async def execute_late_fee_decision(
             tax_paise=tax_paise,
             total_paise=total_paise,
             email_status="pending",
-            notes=f"Late payment fee for Invoice {inv.invoice_number}. {action.reason}"
+            notes=f"Late payment fee for Invoice {inv.invoice_number}. {action.reason}",
+            gst_enabled=getattr(inv, "gst_enabled", None),
         )
         await assign_unique_invoice_number(
             db,
@@ -1308,8 +2530,14 @@ async def execute_late_fee_decision(
         await db.commit()
         await db.refresh(action)
 
-        # Attempt sending PDF
-        if st.smtp_host and st.smtp_from_email and inv.client and inv.client.email:
+        # Attempt sending PDF (respect automatic-send toggle)
+        if (
+            st.smtp_host
+            and st.smtp_from_email
+            and bool(getattr(st, "smtp_auto_send_enabled", True))
+            and inv.client
+            and inv.client.email
+        ):
             try:
                 pdf_bytes = generate_invoice_pdf(
                     invoice=lf_invoice,
@@ -1320,13 +2548,15 @@ async def execute_late_fee_decision(
                     parent_invoice=inv
                 )
                 from ..services.email_html import build_invoice_email
+                from ..services.invoice_mail import invoice_mail_targets
 
+                to_email, cc_email = invoice_mail_targets(inv.client, st)
                 subject, html, plain = build_invoice_email(
                     company_name=st.company_name,
                     company_address=st.company_address or "",
                     company_gstin=st.company_gstin or "",
                     company_logo_url=st.company_logo_url or "/brand/krws-mark.png",
-                    client_name=inv.client.primary_contact_name or inv.client.name,
+                    client_name=inv.client.name,
                     invoice_number=lf_invoice.invoice_number,
                     total_paise=total_paise,
                     due_date=lf_invoice.due_date,
@@ -1337,14 +2567,14 @@ async def execute_late_fee_decision(
                     variant="late_fee",
                 )
                 await send_email_async(
-                    to_email=inv.client.email,
+                    to_email=to_email,
                     subject=subject,
                     body=html,
                     plain_body=plain,
                     settings=st,
                     attachment_bytes=pdf_bytes,
                     attachment_filename=f"{lf_invoice.invoice_number}.pdf",
-                    cc_email=st.invoice_cc_email,
+                    cc_email=cc_email,
                     is_html=True,
                 )
                 lf_invoice.status = "sent"

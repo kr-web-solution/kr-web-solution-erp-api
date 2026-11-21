@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -7,7 +7,7 @@ from ..core.dependencies import get_db, get_current_user, require_founder_ceo, i
 from ..core.database import not_deleted
 from ..models import Client, Project, ProjectClient, Invoice, User
 from ..schemas import ClientResponse, ClientCreate, ClientUpdate
-from ..services.audit import audit_create, audit_soft_delete, audit_update, snapshot_entity
+from ..services.audit import audit_create, audit_soft_delete, audit_update, snapshot_entity, write_audit
 from ..services.client_project import delete_client as delete_client_record
 
 router = APIRouter(prefix="/clients", tags=["Clients"])
@@ -38,6 +38,8 @@ _BLANK_TO_NONE = (
     "state",
     "pincode",
     "gstin",
+    "pan",
+    "state_code",
     "notes",
 )
 
@@ -46,10 +48,33 @@ def _clean_client_payload(data: dict, *, fill_billing_email: bool = False) -> di
     for key in _BLANK_TO_NONE:
         if isinstance(data.get(key), str) and not data[key].strip():
             data[key] = None
-    # Invoices are sent to the company email. Use the contact email when none is given.
+    if isinstance(data.get("name"), str):
+        data["name"] = data["name"].strip()
+    # Prefer an explicit company email. Do not silently promote contact_email to To —
+    # contact person is CC'd on invoice mail instead.
     if fill_billing_email and not data.get("email") and data.get("contact_email"):
         data["email"] = data["contact_email"]
     return data
+
+
+async def _assert_unique_active_name(
+    db: AsyncSession, name: str, *, exclude_id: Optional[str] = None
+) -> None:
+    from sqlalchemy import func
+
+    stmt = select(Client).where(
+        func.lower(Client.name) == name.strip().lower(),
+        not_deleted(Client),
+        Client.is_active == True,  # noqa: E712
+    )
+    if exclude_id:
+        stmt = stmt.where(Client.id != exclude_id)
+    existing = (await db.execute(stmt)).scalars().first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"An active client named '{name.strip()}' already exists",
+        )
 
 @router.get("", response_model=List[ClientResponse])
 async def list_clients(
@@ -140,7 +165,11 @@ async def create_client(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo)
 ):
-    client = Client(**_clean_client_payload(payload.model_dump(), fill_billing_email=True))
+    data = _clean_client_payload(payload.model_dump(), fill_billing_email=True)
+    if not (data.get("name") or "").strip():
+        raise HTTPException(status_code=422, detail="Client name is required")
+    await _assert_unique_active_name(db, data["name"])
+    client = Client(**data, is_active=True)
     db.add(client)
     await db.flush()
     await audit_create(db, client, actor_id=current_user.id, request=request)
@@ -165,7 +194,12 @@ async def update_client(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 
     before = snapshot_entity(client)
-    for k, v in _clean_client_payload(payload.model_dump(exclude_unset=True)).items():
+    data = _clean_client_payload(payload.model_dump(exclude_unset=True))
+    if "name" in data:
+        if not (data.get("name") or "").strip():
+            raise HTTPException(status_code=422, detail="Client name is required")
+        await _assert_unique_active_name(db, data["name"], exclude_id=client.id)
+    for k, v in data.items():
         setattr(client, k, v)
 
     await audit_update(db, client, before, actor_id=current_user.id, request=request)
@@ -180,6 +214,61 @@ async def update_client(
     resp.projects_count = p_cnt
     resp.invoices_count = i_cnt or 0
     return resp
+
+
+@router.post("/{client_id}/deactivate", response_model=ClientResponse)
+async def deactivate_client(
+    client_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    res = await db.execute(select(Client).where(Client.id == client_id, not_deleted(Client)))
+    client = res.scalars().first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    client.is_active = False
+    await write_audit(
+        db,
+        current_user,
+        "clients",
+        client.id,
+        "update",
+        after={"is_active": False},
+        request=request,
+        client_id=client.id,
+    )
+    await db.commit()
+    await db.refresh(client)
+    return ClientResponse.model_validate(client)
+
+
+@router.post("/{client_id}/activate", response_model=ClientResponse)
+async def activate_client(
+    client_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_founder_ceo),
+):
+    res = await db.execute(select(Client).where(Client.id == client_id, not_deleted(Client)))
+    client = res.scalars().first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    await _assert_unique_active_name(db, client.name, exclude_id=client.id)
+    client.is_active = True
+    await write_audit(
+        db,
+        current_user,
+        "clients",
+        client.id,
+        "update",
+        after={"is_active": True},
+        request=request,
+        client_id=client.id,
+    )
+    await db.commit()
+    await db.refresh(client)
+    return ClientResponse.model_validate(client)
 
 @router.delete("/{client_id}", status_code=status.HTTP_200_OK)
 async def delete_client(

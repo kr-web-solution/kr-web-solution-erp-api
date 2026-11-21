@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from ..common.workflow import (
     MAX_STAGE,
     MIN_STAGE,
+    MAINTENANCE_PHASE,
     PIPELINE_STAGES,
     SALES_MAX_STAGE,
     STAGES_BY_NUMBER,
@@ -750,23 +751,23 @@ async def advance_engagement(
         if stage_items and not all(i.is_done for i in stage_items):
             raise HTTPException(status_code=400, detail="Complete current stage checklist before advancing")
 
-    # Leaving stage 4 into onboarding
+    # Leaving stage 4 into requirement analysis / delivery
     if eng.current_stage == 4:
         if eng.engagement_kind == "amc_only":
-            eng.current_stage = 11
+            eng.current_stage = MAINTENANCE_PHASE
             eng.status = "maintenance"
             await db.commit()
             eng = await _load_engagement(db, engagement_id)
             return await _to_detail(db, eng, current_user.role)
         if not eng.client_id:
-            raise HTTPException(status_code=400, detail="Link a client before advancing to onboarding")
+            raise HTTPException(status_code=400, detail="Link a client before advancing to delivery")
 
-    # Completing stage 5 → handoff into Project delivery (phase 6)
+    # Completing stage 5 → handoff into Project delivery (SDLC)
     if eng.current_stage == 5:
         if not eng.project_id:
             raise HTTPException(
                 status_code=400,
-                detail="Convert to project with confirmed commercial terms before completing onboarding",
+                detail="Convert to project with confirmed commercial terms before completing requirement analysis",
             )
         project = await _ensure_project_internal(db, eng)
         await link_engagement_handoff(db, eng, project, enter_delivery=True)
@@ -777,7 +778,7 @@ async def advance_engagement(
     if eng.current_stage >= SALES_MAX_STAGE:
         raise HTTPException(
             status_code=400,
-            detail="Use the Project Delivery tab to continue past onboarding",
+            detail="Use the Project Delivery tab to continue past requirement analysis",
         )
 
     eng.current_stage = min(eng.current_stage + 1, SALES_MAX_STAGE)
@@ -798,7 +799,7 @@ async def regress_engagement(
     if eng.status == "lost":
         raise HTTPException(status_code=400, detail="Cannot regress a lost engagement")
     eng.current_stage -= 1
-    if eng.status == "maintenance" and eng.current_stage < 11:
+    if eng.status == "maintenance" and eng.current_stage < MAINTENANCE_PHASE:
         eng.status = "active"
     if eng.status == "completed":
         eng.status = "active"
@@ -881,7 +882,7 @@ async def resume_engagement(
     eng = await _load_engagement(db, engagement_id)
     if eng.status != "on_hold":
         raise HTTPException(status_code=400, detail="Engagement is not on hold")
-    eng.status = "maintenance" if eng.current_stage == 11 else "active"
+    eng.status = "maintenance" if eng.current_stage >= MAINTENANCE_PHASE else "active"
     await db.commit()
     eng = await _load_engagement(db, engagement_id)
     return await _to_detail(db, eng, current_user.role)
@@ -1019,8 +1020,9 @@ async def create_advance_invoice(
     tax_paise = compute_tax_paise(subtotal, tax_rate)
     total_paise = subtotal + tax_paise
     today = date.today()
+    gst_on = bool(getattr(st, "gst_enabled", False)) if st else False
     inv_number = await allocate_invoice_number(
-        db, invoice_type="project", issue_date=today
+        db, invoice_type="project", issue_date=today, gst_enabled=gst_on
     )
 
     inv = Invoice(
@@ -1035,6 +1037,7 @@ async def create_advance_invoice(
         tax_rate_percent=tax_rate,
         tax_paise=tax_paise,
         total_paise=total_paise,
+        gst_enabled=gst_on,
         email_status="pending",
         notes=f"Advance payment · {eng.title}",
     )

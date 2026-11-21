@@ -37,9 +37,19 @@ def resolve_media_type(
     return raw or "application/octet-stream"
 
 
-def inline_content_disposition(filename: str) -> str:
-    """RFC 5987-friendly inline disposition so browsers preview instead of Save As."""
+def _safe_disposition_filename(filename: str) -> tuple[str, str]:
     safe = (filename or "file").replace('"', "").replace("\n", " ").replace("\r", " ")
     ascii_name = "".join(ch if ord(ch) < 128 else "_" for ch in safe) or "file"
-    encoded = quote(safe)
+    return ascii_name, quote(safe)
+
+
+def inline_content_disposition(filename: str) -> str:
+    """RFC 5987-friendly inline disposition so browsers preview instead of Save As."""
+    ascii_name, encoded = _safe_disposition_filename(filename)
     return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+
+
+def attachment_content_disposition(filename: str) -> str:
+    """RFC 5987-friendly attachment disposition so browsers use the given download name."""
+    ascii_name, encoded = _safe_disposition_filename(filename)
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"

@@ -79,10 +79,16 @@ async def allocate_invoice_number(
     *,
     invoice_type: str = "custom_dev",
     issue_date: Optional[date] = None,
+    gst_enabled: Optional[bool] = None,
 ) -> str:
     from .invoice_numbers import allocate_invoice_number as _allocate
 
-    return await _allocate(db, invoice_type=invoice_type, issue_date=issue_date)
+    return await _allocate(
+        db,
+        invoice_type=invoice_type,
+        issue_date=issue_date,
+        gst_enabled=gst_enabled,
+    )
 
 
 def _month_abbr(d: date) -> str:
@@ -142,8 +148,9 @@ async def create_prorata_invoice(
     due_anchor = send_on if send_on >= start else start
     due_date = due_anchor + timedelta(days=due_after)
 
+    gst_on = bool(getattr(st, "gst_enabled", False)) if st else False
     inv_number = await allocate_invoice_number(
-        db, invoice_type="amc", issue_date=start
+        db, invoice_type="amc", issue_date=start, gst_enabled=gst_on
     )
     desc = (
         f"Maintenance (prorata) {start.day}–{calc.end.day} {_month_abbr(start)} "
@@ -169,6 +176,7 @@ async def create_prorata_invoice(
         tax_rate_percent=tax_rate,
         tax_paise=tax_paise,
         total_paise=total_paise,
+        gst_enabled=gst_on,
         email_status="pending",
         email_retry_count=0,
         notes=f"Pro-rata AMC stub · {calc.period_key}",
@@ -268,8 +276,9 @@ async def create_project_amount_invoice(
     tax_paise = compute_tax_paise(subtotal, tax_rate)
     total_paise = subtotal + tax_paise
     today = date.today()
+    gst_on = bool(getattr(st, "gst_enabled", False)) if st else False
     inv_number = await allocate_invoice_number(
-        db, invoice_type=invoice_type, issue_date=today
+        db, invoice_type=invoice_type, issue_date=today, gst_enabled=gst_on
     )
     inv = Invoice(
         invoice_number=inv_number,
@@ -284,6 +293,7 @@ async def create_project_amount_invoice(
         tax_rate_percent=tax_rate,
         tax_paise=tax_paise,
         total_paise=total_paise,
+        gst_enabled=gst_on,
         email_status="pending",
         notes=notes,
     )

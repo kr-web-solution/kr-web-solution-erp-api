@@ -92,6 +92,9 @@ async def write_audit(
     actor_id: Optional[str] = None,
     changed_fields: Optional[list[str]] = None,
     note: Optional[str] = None,
+    reason: Optional[str] = None,
+    project_id: Optional[str] = None,
+    client_id: Optional[str] = None,
 ) -> Optional[AuditLog]:
     """Best-effort audit row. Nested savepoint so failures never abort the main txn."""
     if note:
@@ -108,6 +111,8 @@ async def write_audit(
         ip = request.client.host if request.client else None
         ua = (request.headers.get("user-agent") or "")[:255] or None
 
+    # Prefer explicit kwargs; fall back to after payload denorm
+    after_map = after if isinstance(after, dict) else {}
     row = AuditLog(
         actor_id=_resolve_actor_id(actor, actor_id),
         entity_type=entity_type,
@@ -116,6 +121,9 @@ async def write_audit(
         changed_fields=changed_fields or [],
         before=_jsonable(before) if before is not None else None,
         after=_jsonable(after) if after is not None else None,
+        reason=reason or (str(after_map.get("reason")) if after_map.get("reason") else None),
+        project_id=project_id or (str(after_map["project_id"]) if after_map.get("project_id") else None),
+        client_id=client_id or (str(after_map["client_id"]) if after_map.get("client_id") else None),
         ip=ip,
         user_agent=ua,
     )

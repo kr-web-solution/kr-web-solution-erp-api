@@ -6,6 +6,8 @@ from calendar import monthrange
 from datetime import date, timedelta
 from typing import Iterable, Optional
 
+from sqlalchemy import inspect as sa_inspect
+
 DEV_TYPES = {
     "advance",
     "balance",
@@ -117,7 +119,12 @@ def summarize_invoices(project, invoices: Iterable) -> dict:
         tax = _tax(inv)
         paid = _paid(inv)
         ledger = getattr(inv, "ledger", None) or ledger_for(getattr(inv, "invoice_type", "") or "")
-        items = list(getattr(inv, "items", None) or [])
+        # Avoid async MissingGreenlet: only use items when already eager-loaded.
+        try:
+            unloaded = sa_inspect(inv).unloaded
+            items = [] if "items" in unloaded else list(getattr(inv, "items", None) or [])
+        except Exception:
+            items = []
         has_line_kinds = any(getattr(it, "line_kind", None) for it in items)
 
         # Mixed / multi-kind invoice: allocate by line_kind (tax proportional to line share)

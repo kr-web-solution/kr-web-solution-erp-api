@@ -32,13 +32,15 @@ async def step_a_generate_recurring_invoices(today: date) -> List[str]:
     """
     Maintenance billing after Go Live:
     - The go-live month is billed separately for the days left.
-    - On the 1st of every later month, generate the full month.
+    - Full months are generated from next_run_date through the current month (missed-month catch-up).
     - Email on Send Day of Month. Due date is that day plus Due After N Days.
     Skips periods already billed (including pro-rata stubs) via period_key.
     """
     from .maintenance_billing import first_of_next_month
+    from .invoice_numbers import assign_unique_invoice_number, is_recurring_period_conflict
+    from .audit import write_audit
+    from .tax_payroll import effective_tax_rate, compute_tax_paise
 
-    period_key = f"{today.year}-{today.month:02d}"
     invoices_to_email = []
 
     async with AsyncSessionLocal() as session:
@@ -61,141 +63,157 @@ async def step_a_generate_recurring_invoices(today: date) -> List[str]:
                 if not proj or not getattr(proj, "go_live_at", None):
                     continue
 
-            # Prefer next_run_date; fall back to send_day for legacy rows
+            # Prefer next_run_date; fall back to first of current month for legacy rows
             if rec.next_run_date is not None:
                 if rec.next_run_date > today:
                     continue
-            elif (rec.send_day or 1) > today.day:
-                continue
+                cursor = date(rec.next_run_date.year, rec.next_run_date.month, 1)
+            else:
+                if (rec.send_day or 1) > today.day:
+                    continue
+                cursor = date(today.year, today.month, 1)
 
-            # Check if an invoice for (recurring_id, period_key) already exists
-            existing = await session.scalar(
-                select(Invoice.id).where(
-                    Invoice.recurring_id == rec.id,
-                    Invoice.period_key == period_key
-                )
-            )
-            if existing:
-                # Period already billed (full or stub) — push next run forward
-                rec.next_run_date = first_of_next_month(today)
-                continue
+            # Cap catch-up window (avoid runaway loops)
+            months_done = 0
+            while cursor <= today and months_done < 24:
+                months_done += 1
+                period_key = f"{cursor.year}-{cursor.month:02d}"
+                month_start = date(cursor.year, cursor.month, 1)
+                month_end = date(cursor.year, cursor.month, monthrange(cursor.year, cursor.month)[1])
 
-            month_start = date(today.year, today.month, 1)
-            month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
-            covered = (
-                await session.execute(
-                    select(Invoice).where(
-                        Invoice.project_id == rec.project_id,
-                        Invoice.ledger == "maintenance",
-                        Invoice.status.notin_(["cancelled", "void"]),
-                        Invoice.covers_from.is_not(None),
-                        Invoice.covers_from <= month_end,
-                        Invoice.covers_to >= month_start,
+                if rec.ends_on and month_start > rec.ends_on:
+                    break
+
+                existing = await session.scalar(
+                    select(Invoice.id).where(
+                        Invoice.recurring_id == rec.id,
+                        Invoice.period_key == period_key,
                     )
                 )
-            ).scalars().first()
-            if covered and covered.covers_to:
-                rec.next_run_date = covered.covers_to + timedelta(days=1)
-                continue
-
-            # Allocate next invoice number atomically
-            st_stmt = select(Settings).where(Settings.id == "default").with_for_update()
-            st = (await session.execute(st_stmt)).scalar_one_or_none()
-            if not st:
-                continue
-
-            from .invoice_numbers import assign_unique_invoice_number, is_recurring_period_conflict
-            from .audit import write_audit
-
-            issue_date = date(today.year, today.month, 1)
-
-            # Full month is created on the 1st. Email waits for the send day.
-            subtotal = rec.amount_paise or 0
-            from .tax_payroll import effective_tax_rate, compute_tax_paise
-            tax_rate = effective_tax_rate(st, float(rec.tax_rate_percent) if rec.tax_rate_percent is not None else None)
-            tax_paise = compute_tax_paise(subtotal, tax_rate)
-            total_paise = subtotal + tax_paise
-            send_on = _month_send_date(today.year, today.month, rec.send_day)
-            due_date = send_on + timedelta(days=rec.due_after_days or 5)
-
-            new_inv = Invoice(
-                invoice_number="",
-                invoice_type="maintenance",
-                ledger="maintenance",
-                client_id=rec.client_id,
-                project_id=rec.project_id,
-                recurring_id=rec.id,
-                period_key=period_key,
-                covers_from=month_start,
-                covers_to=month_end,
-                monthly_rate_paise=subtotal,
-                status="draft",
-                issue_date=issue_date,
-                due_date=due_date,
-                subtotal_paise=subtotal,
-                tax_rate_percent=tax_rate,
-                tax_paise=tax_paise,
-                total_paise=total_paise,
-                email_status="pending",
-                email_retry_count=0,
-                notes=rec.notes or f"Monthly Maintenance - {period_key}"
-            )
-            try:
-                await assign_unique_invoice_number(
-                    session,
-                    new_inv,
-                    invoice_type="maintenance",
-                    issue_date=issue_date,
-                    settings_row=st,
-                )
-            except IntegrityError as exc:
-                if is_recurring_period_conflict(exc):
-                    rec.next_run_date = first_of_next_month(today)
-                    if new_inv in session:
-                        session.expunge(new_inv)
+                if existing:
+                    cursor = first_of_next_month(cursor)
+                    rec.next_run_date = cursor
                     continue
-                raise
 
-            await write_audit(
-                session,
-                None,
-                "invoices",
-                new_inv.id,
-                "create",
-                after={
-                    "invoice_number": new_inv.invoice_number,
-                    "period_key": period_key,
-                    "recurring_id": rec.id,
-                    "note": "scheduler",
-                },
-                note="scheduler",
-            )
+                covered = (
+                    await session.execute(
+                        select(Invoice).where(
+                            Invoice.project_id == rec.project_id,
+                            Invoice.ledger == "maintenance",
+                            Invoice.status.notin_(["cancelled", "void"]),
+                            Invoice.covers_from.is_not(None),
+                            Invoice.covers_from <= month_end,
+                            Invoice.covers_to >= month_start,
+                        )
+                    )
+                ).scalars().first()
+                if covered and covered.covers_to:
+                    cursor = covered.covers_to + timedelta(days=1)
+                    cursor = date(cursor.year, cursor.month, 1)
+                    rec.next_run_date = first_of_next_month(covered.covers_to)
+                    continue
 
-            # Add line items
-            template_items = rec.line_items_template or []
-            if template_items:
-                for itm in template_items:
-                    qty = float(itm.get("quantity", 1))
-                    rate = int(itm.get("unit_rate_paise", subtotal))
-                    session.add(InvoiceItem(
-                        invoice_id=new_inv.id,
-                        description=itm.get("description", f"Maintenance Service ({period_key})"),
-                        quantity=qty,
-                        unit_rate_paise=rate,
-                        amount_paise=int(qty * rate)
-                    ))
-            else:
-                session.add(InvoiceItem(
-                    invoice_id=new_inv.id,
-                    description=f"Monthly Maintenance Support ({period_key})",
-                    quantity=1.0,
-                    unit_rate_paise=subtotal,
-                    amount_paise=subtotal
-                ))
+                st_stmt = select(Settings).where(Settings.id == "default").with_for_update()
+                st = (await session.execute(st_stmt)).scalar_one_or_none()
+                if not st:
+                    break
 
-            rec.next_run_date = first_of_next_month(today)
-            if send_on <= today:
-                invoices_to_email.append(new_inv.id)
+                issue_date = month_start
+                subtotal = rec.amount_paise or 0
+                tax_rate = effective_tax_rate(
+                    st, float(rec.tax_rate_percent) if rec.tax_rate_percent is not None else None
+                )
+                tax_paise = compute_tax_paise(subtotal, tax_rate)
+                total_paise = subtotal + tax_paise
+                send_on = _month_send_date(cursor.year, cursor.month, rec.send_day)
+                due_date = send_on + timedelta(days=rec.due_after_days or 5)
+
+                new_inv = Invoice(
+                    invoice_number="",
+                    invoice_type="maintenance",
+                    ledger="maintenance",
+                    client_id=rec.client_id,
+                    project_id=rec.project_id,
+                    recurring_id=rec.id,
+                    period_key=period_key,
+                    covers_from=month_start,
+                    covers_to=month_end,
+                    monthly_rate_paise=subtotal,
+                    status="draft",
+                    issue_date=issue_date,
+                    due_date=due_date,
+                    subtotal_paise=subtotal,
+                    tax_rate_percent=tax_rate,
+                    tax_paise=tax_paise,
+                    total_paise=total_paise,
+                    gst_enabled=bool(getattr(st, "gst_enabled", False)),
+                    email_status="pending",
+                    email_retry_count=0,
+                    notes=rec.notes or f"Monthly Maintenance - {period_key}",
+                )
+                try:
+                    await assign_unique_invoice_number(
+                        session,
+                        new_inv,
+                        invoice_type="maintenance",
+                        issue_date=issue_date,
+                        settings_row=st,
+                    )
+                except IntegrityError as exc:
+                    if is_recurring_period_conflict(exc):
+                        if new_inv in session:
+                            session.expunge(new_inv)
+                        cursor = first_of_next_month(cursor)
+                        rec.next_run_date = cursor
+                        continue
+                    raise
+
+                await write_audit(
+                    session,
+                    None,
+                    "invoices",
+                    new_inv.id,
+                    "create",
+                    after={
+                        "invoice_number": new_inv.invoice_number,
+                        "period_key": period_key,
+                        "recurring_id": rec.id,
+                        "note": "scheduler",
+                    },
+                    note="scheduler",
+                )
+
+                template_items = rec.line_items_template or []
+                if template_items:
+                    for itm in template_items:
+                        qty = float(itm.get("quantity", 1))
+                        rate = int(itm.get("unit_rate_paise", subtotal))
+                        session.add(
+                            InvoiceItem(
+                                invoice_id=new_inv.id,
+                                description=itm.get(
+                                    "description", f"Maintenance Service ({period_key})"
+                                ),
+                                quantity=qty,
+                                unit_rate_paise=rate,
+                                amount_paise=int(qty * rate),
+                            )
+                        )
+                else:
+                    session.add(
+                        InvoiceItem(
+                            invoice_id=new_inv.id,
+                            description=f"Monthly Maintenance Support ({period_key})",
+                            quantity=1.0,
+                            unit_rate_paise=subtotal,
+                            amount_paise=subtotal,
+                        )
+                    )
+
+                cursor = first_of_next_month(cursor)
+                rec.next_run_date = cursor
+                if send_on <= today:
+                    invoices_to_email.append(new_inv.id)
 
         # Drafts created on the 1st are emailed once Send Day of Month arrives.
         waiting = (
@@ -451,11 +469,15 @@ async def step_d_process_scheduled_late_fees(today: date) -> List[str]:
 
             from .invoice_numbers import allocate_invoice_number
 
+            lf_gst = getattr(parent_inv, "gst_enabled", None)
+            if lf_gst is None:
+                lf_gst = bool(getattr(st, "gst_enabled", False))
             lf_number = await allocate_invoice_number(
                 session,
                 invoice_type="late_fee",
                 issue_date=today,
                 settings_row=st,
+                gst_enabled=bool(lf_gst),
             )
 
             subtotal = act.fee_paise
@@ -477,6 +499,7 @@ async def step_d_process_scheduled_late_fees(today: date) -> List[str]:
                 tax_rate_percent=tax_rate,
                 tax_paise=tax_paise,
                 total_paise=total_paise,
+                gst_enabled=bool(lf_gst),
                 email_status="pending",
                 notes=f"Late fee notice for Invoice {parent_inv.invoice_number}. {act.reason}"
             )
@@ -583,6 +606,13 @@ async def run_daily_maintenance_jobs(today: Optional[date] = None) -> dict:
 
     return summary
 
+def _smtp_auto_send_ok(st: Optional[Settings]) -> bool:
+    """True when SMTP is configured and automatic sending is enabled."""
+    if not st or not st.smtp_host or not st.smtp_from_email:
+        return False
+    return bool(getattr(st, "smtp_auto_send_enabled", True))
+
+
 async def _dispatch_invoice_email(invoice_id: str, is_new: bool = True) -> bool:
     """Renders PDF and sends invoice email outside transactional locks."""
     async with AsyncSessionLocal() as session:
@@ -609,6 +639,11 @@ async def _dispatch_invoice_email(invoice_id: str, is_new: bool = True) -> bool:
             inv.email_retry_count += 1
             await session.commit()
             return False
+        if not bool(getattr(st, "smtp_auto_send_enabled", True)):
+            inv.email_status = "pending"
+            inv.email_error = "Automatic email send is turned off in Settings."
+            await session.commit()
+            return False
 
         # Generate PDF
         pdf_bytes = generate_invoice_pdf(
@@ -621,6 +656,14 @@ async def _dispatch_invoice_email(invoice_id: str, is_new: bool = True) -> bool:
         )
 
         from .email_html import compose_invoice_client_email
+        from .invoice_mail import invoice_mail_targets
+
+        if not (inv.client.email or "").strip():
+            inv.email_status = "failed"
+            inv.email_error = "Client company has no email address."
+            inv.email_retry_count += 1
+            await session.commit()
+            return False
 
         # Paid invoices must never get an "invoice ready / total payable" mail
         if inv.status == "paid":
@@ -630,12 +673,13 @@ async def _dispatch_invoice_email(invoice_id: str, is_new: bool = True) -> bool:
         else:
             kind_force = None
 
+        to_email, cc_email = invoice_mail_targets(inv.client, st)
         _kind, subject, html, plain, attachment_name = compose_invoice_client_email(
             company_name=st.company_name,
             company_address=st.company_address or "",
             company_gstin=st.company_gstin or "",
             company_logo_url=st.company_logo_url or "/brand/krws-mark.png",
-            client_name=inv.client.primary_contact_name or inv.client.name,
+            client_name=inv.client.name,
             invoice_number=inv.invoice_number,
             total_paise=inv.total_paise,
             due_date=inv.due_date,
@@ -651,14 +695,14 @@ async def _dispatch_invoice_email(invoice_id: str, is_new: bool = True) -> bool:
 
         try:
             await send_email_async(
-                to_email=inv.client.email,
+                to_email=to_email,
                 subject=subject,
                 body=html,
                 plain_body=plain,
                 settings=st,
                 attachment_bytes=pdf_bytes,
                 attachment_filename=attachment_name,
-                cc_email=st.invoice_cc_email,
+                cc_email=cc_email,
                 is_html=True,
             )
             inv.email_status = "sent"
@@ -688,7 +732,7 @@ async def _dispatch_reminder_email(invoice_id: str, today: date, overdue: bool =
             return False
 
         st = (await session.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
-        if not st or not st.smtp_host or not st.smtp_from_email:
+        if not _smtp_auto_send_ok(st):
             return False
 
         pdf_bytes = generate_invoice_pdf(
@@ -700,18 +744,22 @@ async def _dispatch_reminder_email(invoice_id: str, today: date, overdue: bool =
         )
 
         from .email_html import compose_invoice_client_email
+        from .invoice_mail import invoice_mail_targets
 
         if inv.status == "paid" or inv.paid_at:
+            return False
+        if not (inv.client.email or "").strip():
             return False
 
         days_left = (inv.due_date - today).days
         force_kind = "overdue" if (overdue or days_left < 0) else "reminder"
+        to_email, cc_email = invoice_mail_targets(inv.client, st)
         _kind, subject, html, plain, attachment_name = compose_invoice_client_email(
             company_name=st.company_name,
             company_address=st.company_address or "",
             company_gstin=st.company_gstin or "",
             company_logo_url=st.company_logo_url or "/brand/krws-mark.png",
-            client_name=inv.client.primary_contact_name or inv.client.name,
+            client_name=inv.client.name,
             invoice_number=inv.invoice_number,
             total_paise=inv.total_paise,
             due_date=inv.due_date,
@@ -729,14 +777,14 @@ async def _dispatch_reminder_email(invoice_id: str, today: date, overdue: bool =
 
         try:
             await send_email_async(
-                to_email=inv.client.email,
+                to_email=to_email,
                 subject=subject,
                 body=html,
                 plain_body=plain,
                 settings=st,
                 attachment_bytes=pdf_bytes,
                 attachment_filename=attachment_name,
-                cc_email=st.invoice_cc_email,
+                cc_email=cc_email,
                 is_html=True,
             )
             inv.reminder_count += 1
@@ -751,7 +799,7 @@ async def _notify_founders_of_overdue(overdue_list: List[dict]):
     """Sends an overdue summary email exclusively to Founder CEO accounts."""
     async with AsyncSessionLocal() as session:
         st = (await session.execute(select(Settings).where(Settings.id == "default"))).scalars().first()
-        if not st or not st.smtp_host or not st.smtp_from_email:
+        if not _smtp_auto_send_ok(st):
             return
 
         founders = (await session.execute(

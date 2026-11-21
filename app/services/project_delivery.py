@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from ..common.workflow import (
     DELIVERY_MIN_STAGE,
+    MAINTENANCE_PHASE,
     STAGES_BY_NUMBER,
     build_project_delivery_checklist_seed,
 )
@@ -71,12 +72,12 @@ async def sync_engagement_from_project(db: AsyncSession, project: Project) -> No
         return
 
     eng.current_stage = project.delivery_phase
-    if project.delivery_phase >= 11:
+    if project.delivery_phase >= MAINTENANCE_PHASE:
         eng.status = "maintenance" if project.status != "completed" else "completed"
     elif eng.status not in ("lost", "on_hold", "completed"):
         eng.status = "active"
 
-    # Mirror checklist done flags for stages <= delivery_phase on engagement items 06–11
+    # Mirror checklist done flags for stages <= delivery_phase on engagement delivery items
     phase = project.delivery_phase
     proj_items = (
         await db.execute(select(ProjectChecklistItem).where(ProjectChecklistItem.project_id == project.id))
@@ -84,7 +85,7 @@ async def sync_engagement_from_project(db: AsyncSession, project: Project) -> No
     done_keys = {(i.stage_number, i.item_key) for i in proj_items if i.is_done or i.stage_number < phase}
 
     for item in eng.checklist_items or []:
-        if item.stage_number < 5:
+        if item.stage_number < DELIVERY_MIN_STAGE:
             continue
         should = (item.stage_number, item.item_key) in done_keys or item.stage_number < phase
         if should and not item.is_done:
@@ -115,16 +116,11 @@ async def link_engagement_handoff(
     *,
     enter_delivery: bool = True,
 ) -> None:
-    """After onboarding: link both ways, seed checklist, move to design/dev."""
+    """After sales handoff: link both ways, seed checklist, enter Requirement Analysis."""
     project.engagement_id = eng.id
     eng.project_id = project.id
-    await ensure_project_checklist(db, project, done_through_stage=5 if enter_delivery else 0)
+    await ensure_project_checklist(db, project, done_through_stage=0)
     if enter_delivery:
-        project.delivery_phase = max(project.delivery_phase or DELIVERY_MIN_STAGE, 6)
-        eng.current_stage = max(eng.current_stage, 6)
-        # Mark stage 5 engagement checklist done
-        for item in eng.checklist_items or []:
-            if item.stage_number == 5:
-                item.is_done = True
-                item.done_at = datetime.now(timezone.utc)
+        project.delivery_phase = max(project.delivery_phase or DELIVERY_MIN_STAGE, DELIVERY_MIN_STAGE)
+        eng.current_stage = max(eng.current_stage, DELIVERY_MIN_STAGE)
     await sync_engagement_from_project(db, project)

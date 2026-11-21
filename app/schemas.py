@@ -131,7 +131,7 @@ class ResetPasswordRequest(BaseModel):
 
 # ----------------- Clients -----------------
 class ClientBase(BaseModel):
-    name: str
+    name: str = Field(min_length=1)
     primary_contact_name: Optional[str] = None
     designation: Optional[str] = None
     contact_email: Optional[str] = None
@@ -144,13 +144,15 @@ class ClientBase(BaseModel):
     state: Optional[str] = None
     pincode: Optional[str] = None
     gstin: Optional[str] = None
+    pan: Optional[str] = None
+    state_code: Optional[str] = None
     notes: Optional[str] = None
 
 class ClientCreate(ClientBase):
     pass
 
 class ClientUpdate(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, min_length=1)
     primary_contact_name: Optional[str] = None
     designation: Optional[str] = None
     contact_email: Optional[str] = None
@@ -163,10 +165,14 @@ class ClientUpdate(BaseModel):
     state: Optional[str] = None
     pincode: Optional[str] = None
     gstin: Optional[str] = None
+    pan: Optional[str] = None
+    state_code: Optional[str] = None
     notes: Optional[str] = None
+    is_active: Optional[bool] = None
 
 class ClientResponse(ClientBase, OrmBase):
     id: str
+    is_active: bool = True
     created_at: datetime
     updated_at: datetime
     projects_count: Optional[int] = 0
@@ -241,6 +247,7 @@ class ProjectBase(BaseModel):
     status: str = "running"  # "lead", "running", "on_hold", "stopped", "completed"
 
 class ProjectCreate(ProjectBase):
+    # At least one client is required — projects.client_id is NOT NULL in DB.
     client_ids: List[str] = Field(min_length=1)
     worker_ids: Optional[List[str]] = []
     development_days: Optional[int] = Field(None, ge=1)
@@ -256,7 +263,9 @@ class ProjectCreate(ProjectBase):
         legacy = data.get("client_id")
         if legacy and legacy not in ids:
             ids = [legacy] + ids
-        data = {**data, "client_ids": ids}
+        if not ids:
+            raise ValueError("A project must have at least one client (client_id / client_ids).")
+        data = {**data, "client_ids": ids, "client_id": ids[0]}
         return data
 
 class ProjectUpdate(BaseModel):
@@ -271,7 +280,14 @@ class ProjectUpdate(BaseModel):
     advance_paise: Optional[int] = Field(None, ge=0)
     maintenance_amount_paise: Optional[int] = Field(None, ge=0)
     status: Optional[str] = None
+    status_reason: Optional[str] = None
+    reopen_reason: Optional[str] = None
+    force_complete: Optional[bool] = False
+    force_complete_reason: Optional[str] = None
     worker_ids: Optional[List[str]] = None
+
+class ProjectMilestoneRequest(BaseModel):
+    reason: Optional[str] = None
 
 class ProjectResponse(OrmBase):
     id: str
@@ -293,6 +309,16 @@ class ProjectResponse(OrmBase):
     balance_invoice_id: Optional[str] = None
     go_live_at: Optional[date] = None
     status: str
+    status_reason: Optional[str] = None
+    reopened_at: Optional[datetime] = None
+    reopened_by: Optional[str] = None
+    development_completed_at: Optional[datetime] = None
+    development_completed_by: Optional[str] = None
+    client_accepted_at: Optional[datetime] = None
+    client_accepted_by: Optional[str] = None
+    project_closed_at: Optional[datetime] = None
+    project_closed_by: Optional[str] = None
+    closed_reason: Optional[str] = None
     delivery_phase: int = 5
     delivery_phase_name: Optional[str] = None
     engagement_id: Optional[str] = None
@@ -347,9 +373,23 @@ class ProjectChecklistItemResponse(OrmBase):
     done_by: Optional[str] = None
 
 
+class ProjectPhaseNoteResponse(OrmBase):
+    stage_number: int
+    body: Optional[str] = None
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+
+class ProjectPhaseNoteUpdate(BaseModel):
+    """Optional free-text note for one delivery phase. Empty/null clears the note."""
+
+    body: Optional[str] = None
+
+
 class ProjectDeliveryDetailResponse(ProjectResponse):
     checklist_items: List[ProjectChecklistItemResponse] = []
     checklist_progress_percent: int = 0
+    phase_notes: List[ProjectPhaseNoteResponse] = []
 
 
 class ProjectFeatureDocCreate(BaseModel):
@@ -385,6 +425,9 @@ class ProjectFeatureDocResponse(OrmBase):
     title: str
     body_or_url: str
     doc_type: str
+    original_filename: Optional[str] = None
+    content_type: Optional[str] = None
+    size_bytes: Optional[int] = None
     created_by: Optional[str] = None
     created_at: datetime
 
@@ -392,24 +435,77 @@ class ProjectFeatureDocResponse(OrmBase):
 class ProjectFeatureCreate(BaseModel):
     title: str
     description: Optional[str] = None
-    status: str = "requested"
+    business_purpose: Optional[str] = None
+    request_type: str = "new_feature"
+    expected_functionality: Optional[str] = None
+    priority: str = "medium"
+    expected_date: Optional[date] = None
+    acceptance_criteria: Optional[str] = None
+    status: str = "submitted"
     quoted_paise: Optional[int] = None
+    is_billable: bool = True
+    dev_hours: Optional[float] = None
+    test_hours: Optional[float] = None
+    complexity: Optional[str] = None
+    dev_cost_paise: Optional[int] = None
+    expense_paise: Optional[int] = None
+    estimated_delivery_date: Optional[date] = None
+    assignee_user_id: Optional[str] = None
+    internal_notes: Optional[str] = None
 
 
 class ProjectFeatureUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
+    business_purpose: Optional[str] = None
+    request_type: Optional[str] = None
+    expected_functionality: Optional[str] = None
+    priority: Optional[str] = None
+    expected_date: Optional[date] = None
+    acceptance_criteria: Optional[str] = None
     status: Optional[str] = None
+    status_reason: Optional[str] = None
     quoted_paise: Optional[int] = None
+    is_billable: Optional[bool] = None
+    dev_hours: Optional[float] = None
+    test_hours: Optional[float] = None
+    complexity: Optional[str] = None
+    dev_cost_paise: Optional[int] = None
+    expense_paise: Optional[int] = None
+    estimated_delivery_date: Optional[date] = None
+    assignee_user_id: Optional[str] = None
+    internal_notes: Optional[str] = None
 
 
 class ProjectFeatureResponse(OrmBase):
     id: str
     project_id: str
+    cr_number: Optional[str] = None
     title: str
     description: Optional[str] = None
+    business_purpose: Optional[str] = None
+    request_type: str = "new_feature"
+    expected_functionality: Optional[str] = None
+    priority: str = "medium"
+    expected_date: Optional[date] = None
+    acceptance_criteria: Optional[str] = None
     status: str
     quoted_paise: Optional[int] = None
+    is_billable: bool = True
+    submitted_by: Optional[str] = None
+    dev_hours: Optional[float] = None
+    test_hours: Optional[float] = None
+    complexity: Optional[str] = None
+    dev_cost_paise: Optional[int] = None
+    expense_paise: Optional[int] = None
+    estimated_delivery_date: Optional[date] = None
+    assignee_user_id: Optional[str] = None
+    internal_notes: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    client_accepted_at: Optional[datetime] = None
+    project_name: Optional[str] = None
+    client_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     docs: List[ProjectFeatureDocResponse] = []
@@ -423,11 +519,47 @@ class InvoiceItemBase(BaseModel):
     # Optional per-line kind so one invoice can mix development + maintenance, etc.
     # Aliases accepted: development/dev → custom_dev, maintenance/mnt → amc
     line_kind: Optional[str] = None
+    hsn_sac: Optional[str] = None
+    unit: Optional[str] = None
 
 class InvoiceItemResponse(InvoiceItemBase, OrmBase):
     id: str
     amount_paise: int
     line_kind: Optional[str] = None
+    hsn_sac: Optional[str] = None
+    unit: Optional[str] = None
+
+
+class InvoicePaymentResponse(OrmBase):
+    id: str
+    amount_paise: int
+    method: Optional[str] = None
+    reference: Optional[str] = None
+    paid_at: Optional[datetime] = None
+    note: Optional[str] = None
+    status: str = "verified"
+    rejection_reason: Optional[str] = None
+    recorded_by: Optional[str] = None
+    verified_by: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    rejected_by: Optional[str] = None
+    rejected_at: Optional[datetime] = None
+    has_proof: bool = False
+
+
+class InvoicePaymentCreate(BaseModel):
+    amount_paise: int = Field(gt=0)
+    method: Optional[str] = "bank_transfer"
+    reference: Optional[str] = None
+    note: Optional[str] = None
+    paid_at: Optional[datetime] = None
+    # Founder may record as already verified (manual entry)
+    mark_verified: bool = True
+
+
+class InvoicePaymentReject(BaseModel):
+    reason: str = Field(min_length=1)
+
 
 class InvoiceCreate(BaseModel):
     # custom_dev | amc | advance | balance | mixed | … — mixed auto-detected from line_kind
@@ -437,6 +569,8 @@ class InvoiceCreate(BaseModel):
     issue_date: date
     due_date: date
     tax_rate_percent: float = 0.0
+    # None = follow Settings; True/False = override for this invoice only
+    gst_enabled: Optional[bool] = None
     notes: Optional[str] = None
     upi_id_override: Optional[str] = None
     upi_qr_url: Optional[str] = None
@@ -445,6 +579,8 @@ class InvoiceCreate(BaseModel):
     covers_from: Optional[date] = None
     covers_to: Optional[date] = None
     monthly_rate_paise: Optional[int] = None
+    discount_paise: int = 0
+    po_number: Optional[str] = None
     # When creating already-settled historical invoices
     status: Optional[str] = None
     paid_at: Optional[datetime] = None
@@ -462,6 +598,7 @@ class InvoiceUpdate(BaseModel):
     issue_date: Optional[date] = None
     due_date: Optional[date] = None
     tax_rate_percent: Optional[float] = None
+    gst_enabled: Optional[bool] = None
     notes: Optional[str] = None
     status: Optional[str] = None
     upi_id_override: Optional[str] = None
@@ -471,11 +608,58 @@ class InvoiceUpdate(BaseModel):
     covers_from: Optional[date] = None
     covers_to: Optional[date] = None
     monthly_rate_paise: Optional[int] = None
+    discount_paise: Optional[int] = None
+    po_number: Optional[str] = None
 
 class CreditNoteCreate(BaseModel):
     reason: Optional[str] = None
     # If omitted, credit the full parent total (ex-GST lines rebuilt as a single credit line).
     amount_paise: Optional[int] = None
+
+
+class DebitNoteCreate(BaseModel):
+    reason: Optional[str] = None
+    # Extra charge ex-GST. Required — debit notes must state the additional amount.
+    amount_paise: int
+    description: Optional[str] = None
+
+
+class GstRegistrationResponse(OrmBase):
+    id: str
+    gstin: str
+    legal_name: Optional[str] = None
+    address: Optional[str] = None
+    state: Optional[str] = None
+    state_code: str
+    effective_from: date
+    effective_to: Optional[date] = None
+    is_primary: bool = False
+    is_active: bool = True
+
+
+class GstRegistrationCreate(BaseModel):
+    gstin: str
+    legal_name: Optional[str] = None
+    address: Optional[str] = None
+    state: Optional[str] = None
+    state_code: str
+    effective_from: date
+    effective_to: Optional[date] = None
+    is_primary: bool = False
+    is_active: bool = True
+
+
+class GstRegistrationUpdate(BaseModel):
+    gstin: Optional[str] = None
+    legal_name: Optional[str] = None
+    address: Optional[str] = None
+    state: Optional[str] = None
+    state_code: Optional[str] = None
+    effective_from: Optional[date] = None
+    effective_to: Optional[date] = None
+    is_primary: Optional[bool] = None
+    is_active: Optional[bool] = None
+
 
 class InvoiceResponse(OrmBase):
     id: str
@@ -494,6 +678,8 @@ class InvoiceResponse(OrmBase):
     client_state: Optional[str] = None
     client_pincode: Optional[str] = None
     client_gstin: Optional[str] = None
+    client_pan: Optional[str] = None
+    client_state_code: Optional[str] = None
     project_id: Optional[str] = None
     project_name: Optional[str] = None
     project_ref: Optional[str] = None
@@ -504,7 +690,22 @@ class InvoiceResponse(OrmBase):
     tax_rate_percent: float
     tax_paise: int
     total_paise: int
+    place_of_supply: Optional[str] = None
+    supply_type: Optional[str] = None
+    cgst_paise: int = 0
+    sgst_paise: int = 0
+    igst_paise: int = 0
+    discount_paise: int = 0
+    round_off_paise: int = 0
+    amount_paid_paise: int = 0
+    balance_due_paise: int = 0
+    po_number: Optional[str] = None
+    amount_in_words: Optional[str] = None
     notes: Optional[str] = None
+    resolved_terms: List[str] = []
+    snapshot_frozen_at: Optional[datetime] = None
+    document_locked: bool = False
+    payments: List[InvoicePaymentResponse] = []
     upi_id_override: Optional[str] = None
     upi_qr_url: Optional[str] = None
     paid_at: Optional[datetime] = None
@@ -538,8 +739,20 @@ class InvoiceResponse(OrmBase):
     payment_bank_name: Optional[str] = None
     payment_bank_account_number: Optional[str] = None
     payment_bank_ifsc: Optional[str] = None
+    payment_paypal_id: Optional[str] = None
     payment_bank_upi_details: Optional[str] = None
+    payment_bank_wire_instructions: Optional[str] = None
+    payment_wire_lines: List[str] = []
+    # Effective GST for this document (override or Settings).
     gst_enabled: bool = False
+    # Raw per-invoice override: null = follow Settings; true/false = fixed for this invoice.
+    gst_enabled_override: Optional[bool] = None
+    # Unpaid + latest in series + no children — UI may allow GST series switch.
+    can_change_gst: bool = False
+    # Lowest free number if GST were toggled to the opposite series (preview only).
+    gst_toggle_preview_number: Optional[str] = None
+    # Unpaid/cancellable + tip of series — UI may show delete.
+    can_delete: bool = False
     # Company document header snapshot (from settings)
     company_name: Optional[str] = None
     company_address: Optional[str] = None
@@ -549,6 +762,11 @@ class InvoiceResponse(OrmBase):
     company_website: Optional[str] = None
     company_tagline: Optional[str] = None
     company_logo_url: Optional[str] = None
+    company_pan: Optional[str] = None
+    company_state: Optional[str] = None
+    company_state_code: Optional[str] = None
+    gst_unregistered: bool = False
+    default_sac_code: Optional[str] = None
     payment_terms: Optional[str] = None
 
 # ----------------- Recurring Invoices -----------------
@@ -666,15 +884,22 @@ class SettingsResponse(OrmBase):
     company_address: Optional[str] = None
     company_gstin: Optional[str] = None
     company_logo_url: Optional[str] = None
+    company_logo_content_hash: Optional[str] = None
     company_phone: Optional[str] = None
     company_website: Optional[str] = None
     company_tagline: Optional[str] = None
+    company_pan: Optional[str] = None
+    company_state: Optional[str] = None
+    company_state_code: Optional[str] = None
     invoice_prefix: str
     invoice_next_number: int
     invoice_sequences: dict = {}
     invoice_prefix_scheme: List[dict] = []
     default_tax_rate: float
     gst_enabled: bool = False
+    gst_unregistered: bool = False
+    invoice_terms_by_type: dict = {}
+    default_sac_code: Optional[str] = None
     pf_enabled: bool = False
     pf_employee_percent: float = 0
     esi_enabled: bool = False
@@ -687,7 +912,9 @@ class SettingsResponse(OrmBase):
     bank_account_number: Optional[str] = None
     bank_ifsc: Optional[str] = None
     bank_upi_id: Optional[str] = None
+    bank_paypal_id: Optional[str] = None
     bank_upi_details: Optional[str] = None
+    bank_wire_instructions: Optional[str] = None
     bank_upi_qr_url: Optional[str] = None
     smtp_host: Optional[str] = None
     smtp_port: int
@@ -696,7 +923,9 @@ class SettingsResponse(OrmBase):
     smtp_use_tls: bool
     smtp_from_name: Optional[str] = None
     smtp_from_email: Optional[str] = None
+    smtp_auto_send_enabled: bool = True
     invoice_cc_email: Optional[str] = None
+    gst_registrations: List[GstRegistrationResponse] = []
 
 class SettingsUpdate(BaseModel):
     company_name: Optional[str] = None
@@ -706,11 +935,17 @@ class SettingsUpdate(BaseModel):
     company_phone: Optional[str] = None
     company_website: Optional[str] = None
     company_tagline: Optional[str] = None
+    company_pan: Optional[str] = None
+    company_state: Optional[str] = None
+    company_state_code: Optional[str] = None
     invoice_prefix: Optional[str] = None
     invoice_next_number: Optional[int] = None
     invoice_sequences: Optional[dict] = None
     default_tax_rate: Optional[float] = None
     gst_enabled: Optional[bool] = None
+    gst_unregistered: Optional[bool] = None
+    invoice_terms_by_type: Optional[dict] = None
+    default_sac_code: Optional[str] = None
     pf_enabled: Optional[bool] = None
     pf_employee_percent: Optional[float] = None
     esi_enabled: Optional[bool] = None
@@ -723,7 +958,9 @@ class SettingsUpdate(BaseModel):
     bank_account_number: Optional[str] = None
     bank_ifsc: Optional[str] = None
     bank_upi_id: Optional[str] = None
+    bank_paypal_id: Optional[str] = None
     bank_upi_details: Optional[str] = None
+    bank_wire_instructions: Optional[str] = None
     bank_upi_qr_url: Optional[str] = None
     invoice_cc_email: Optional[str] = None
 
@@ -735,6 +972,7 @@ class SMTPSettingsUpdate(BaseModel):
     smtp_use_tls: Optional[bool] = None
     smtp_from_name: Optional[str] = None
     smtp_from_email: Optional[str] = None
+    smtp_auto_send_enabled: Optional[bool] = None
 
 class TestEmailRequest(BaseModel):
     to_email: EmailStr

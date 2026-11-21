@@ -46,6 +46,7 @@ INVOICE_TYPES = [
     _row("itp", "maintenance", "Maintenance", 90, service_code="MNT", default_ledger_code="maintenance"),
     _row("itp", "late_fee", "Late fee", 100, service_code="SVC", default_ledger_code="development"),
     _row("itp", "credit_note", "Credit note", 110, service_code="CRN", default_ledger_code="development"),
+    _row("itp", "mixed", "Mixed", 120, service_code="MIX", default_ledger_code="development"),
 ]
 
 INVOICE_STATUSES = [
@@ -55,6 +56,7 @@ INVOICE_STATUSES = [
     _row("ist", "overdue", "Overdue", 40),
     _row("ist", "cancelled", "Cancelled", 50),
     _row("ist", "void", "Void", 60),
+    _row("ist", "proof_pending", "Proof pending", 70),
 ]
 
 EMAIL_DELIVERY_STATUSES = [

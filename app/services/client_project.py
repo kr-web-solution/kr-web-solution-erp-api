@@ -44,6 +44,11 @@ async def assert_clients_exist(db: AsyncSession, client_ids: Iterable[str]) -> L
     missing = [cid for cid in ids if cid not in found_ids]
     if missing:
         raise NotFoundError(f"Client not found: {missing[0]}")
+    inactive = [c for c in found if getattr(c, "is_active", True) is False]
+    if inactive:
+        raise BusinessRuleError(
+            f"Client '{inactive[0].name}' is deactivated and cannot be linked to new work"
+        )
     return found
 
 

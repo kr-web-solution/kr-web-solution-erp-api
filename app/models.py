@@ -166,6 +166,7 @@ class Client(SoftDeleteMixin, TimestampMixin, Base):
         index=True
     )
     name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     primary_contact_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     designation: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     contact_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -178,6 +179,8 @@ class Client(SoftDeleteMixin, TimestampMixin, Base):
     state: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     pincode: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     gstin: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    pan: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    state_code: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Relationships
@@ -237,7 +240,10 @@ class Project(SoftDeleteMixin, TimestampMixin, Base):
         index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Primary/billing client — required; a project cannot exist without a client.
+    client_id: Mapped[str] = mapped_column(
+        ForeignKey("clients.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -252,6 +258,30 @@ class Project(SoftDeleteMixin, TimestampMixin, Base):
         nullable=True,
     )
     go_live_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    status_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reopened_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reopened_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    development_completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    development_completed_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    client_accepted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    client_accepted_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    project_closed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    project_closed_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    closed_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     project_type_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("project_types.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -263,7 +293,7 @@ class Project(SoftDeleteMixin, TimestampMixin, Base):
     pipeline_stage_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("pipeline_stages.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    delivery_phase: Mapped[int] = mapped_column(Integer, default=5, nullable=False, index=True)  # 5–11
+    delivery_phase: Mapped[int] = mapped_column(Integer, default=5, nullable=False, index=True)  # 5–14 SDLC
     engagement_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("engagements.id", ondelete="SET NULL", use_alter=True, name="fk_projects_engagement_id"),
         nullable=True,
@@ -300,6 +330,12 @@ class Project(SoftDeleteMixin, TimestampMixin, Base):
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="ProjectChecklistItem.stage_number, ProjectChecklistItem.sort_order",
+    )
+    phase_notes: Mapped[List["ProjectPhaseNote"]] = relationship(
+        "ProjectPhaseNote",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectPhaseNote.stage_number",
     )
     features: Mapped[List["ProjectFeature"]] = relationship(
         "ProjectFeature",
@@ -341,6 +377,37 @@ class ProjectClient(Base):
     )
 
 
+class ProjectStatusEvent(Base):
+    """Append-only project status transition history."""
+
+    __tablename__ = "project_status_events"
+    __table_args__ = (
+        Index("ix_project_status_events_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: f"pse_{uuid.uuid4().hex[:10]}",
+        index=True,
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    from_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    to_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
 class ProjectWorker(SoftDeleteMixin, Base):
     __tablename__ = "project_workers"
 
@@ -373,7 +440,37 @@ class ProjectChecklistItem(SoftDeleteMixin, Base):
     done_by_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[done_by])
 
 
+class ProjectPhaseNote(TimestampMixin, Base):
+    """Optional free-text note for a single delivery phase (05–11). Not required to advance."""
+
+    __tablename__ = "project_phase_notes"
+    __table_args__ = (
+        UniqueConstraint("project_id", "stage_number", name="uq_project_phase_note"),
+        Index("ix_project_phase_notes_project_stage", "project_id", "stage_number"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: f"ppn_{uuid.uuid4().hex[:10]}",
+        index=True,
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stage_number: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    body: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    updated_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    project: Mapped["Project"] = relationship("Project", back_populates="phase_notes")
+    updated_by_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[updated_by])
+
+
 class ProjectFeature(SoftDeleteMixin, TimestampMixin, Base):
+    """Change request / additional feature beyond the original project quote."""
+
     __tablename__ = "project_features"
 
     id: Mapped[str] = mapped_column(
@@ -383,12 +480,46 @@ class ProjectFeature(SoftDeleteMixin, TimestampMixin, Base):
         index=True,
     )
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    cr_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, unique=True, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    business_purpose: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    request_type: Mapped[str] = mapped_column(
+        String(40), default="new_feature", nullable=False, index=True
+    )
+    expected_functionality: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    priority: Mapped[str] = mapped_column(
+        String(20), default="medium", nullable=False, index=True
+    )  # low, medium, high, urgent
+    expected_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    acceptance_criteria: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
-        String(20), default="requested", nullable=False, index=True
-    )  # requested, approved, in_progress, done, rejected
+        String(32), default="submitted", nullable=False, index=True
+    )
     quoted_paise: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    submitted_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Internal estimation
+    dev_hours: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
+    test_hours: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
+    complexity: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    dev_cost_paise: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    expense_paise: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    estimated_delivery_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    assignee_user_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    internal_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_billable: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    cancel_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    client_accepted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    client_accepted_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     project: Mapped["Project"] = relationship("Project", back_populates="features")
     docs: Mapped[List["ProjectFeatureDoc"]] = relationship(
@@ -396,6 +527,73 @@ class ProjectFeature(SoftDeleteMixin, TimestampMixin, Base):
         back_populates="feature",
         cascade="all, delete-orphan",
         order_by="ProjectFeatureDoc.created_at.desc()",
+    )
+
+
+class ProjectFeatureEvent(Base):
+    """Append-only change-request status history."""
+
+    __tablename__ = "project_feature_events"
+    __table_args__ = (
+        Index("ix_project_feature_events_feature_created", "feature_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: f"pfe_{uuid.uuid4().hex[:10]}",
+        index=True,
+    )
+    feature_id: Mapped[str] = mapped_column(
+        ForeignKey("project_features.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    from_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class ProjectChecklistEvent(Base):
+    """Preserves checklist completion evidence when items are unticked."""
+
+    __tablename__ = "project_checklist_events"
+    __table_args__ = (
+        Index("ix_project_checklist_events_item_created", "item_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: f"pce_{uuid.uuid4().hex[:10]}",
+        index=True,
+    )
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("project_checklist_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    action: Mapped[str] = mapped_column(String(20), nullable=False)  # done | undone
+    actor_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    done_at_snapshot: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    done_by_snapshot: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+        nullable=False,
     )
 
 
@@ -410,8 +608,14 @@ class ProjectFeatureDoc(SoftDeleteMixin, Base):
     )
     feature_id: Mapped[str] = mapped_column(ForeignKey("project_features.id", ondelete="CASCADE"), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
-    body_or_url: Mapped[str] = mapped_column(Text, nullable=False)
-    doc_type: Mapped[str] = mapped_column(String(20), default="note", nullable=False)  # note, link, spec
+    body_or_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    doc_type: Mapped[str] = mapped_column(
+        String(20), default="note", nullable=False
+    )  # note, link, spec, attachment
+    original_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    stored_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    content_type: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_by: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -485,7 +689,7 @@ class Invoice(SoftDeleteMixin, TimestampMixin, Base):
     covers_from: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     covers_to: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     monthly_rate_paise: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="RESTRICT"), nullable=False, index=True)
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True
     )
@@ -503,9 +707,23 @@ class Invoice(SoftDeleteMixin, TimestampMixin, Base):
     tax_rate_percent: Mapped[float] = mapped_column(Numeric(5, 2), default=0.00, nullable=False)
     tax_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     total_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # None = follow company Settings gst_enabled; True/False = per-invoice override
+    gst_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    place_of_supply: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    supply_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # intra | inter
+    cgst_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    sgst_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    igst_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    discount_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    round_off_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    amount_paid_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    po_number: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     upi_id_override: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     upi_qr_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # Frozen party/company/bank/terms at issue time — issued PDFs must not drift with settings
+    document_snapshot: Mapped[Any] = mapped_column(JSON, nullable=True)
+    snapshot_frozen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Client payment proof (UPI/bank screenshot/PDF) — founder verifies then marks paid
@@ -544,7 +762,56 @@ class Invoice(SoftDeleteMixin, TimestampMixin, Base):
     recurring_invoice: Mapped[Optional["RecurringInvoice"]] = relationship("RecurringInvoice", foreign_keys=[recurring_id])
     parent_invoice: Mapped[Optional["Invoice"]] = relationship("Invoice", remote_side=[id], foreign_keys=[parent_invoice_id])
     items: Mapped[List["InvoiceItem"]] = relationship("InvoiceItem", back_populates="invoice", cascade="all, delete-orphan", order_by="InvoiceItem.id")
+    payments: Mapped[List["InvoicePayment"]] = relationship(
+        "InvoicePayment",
+        back_populates="invoice",
+        cascade="all, delete-orphan",
+        order_by="InvoicePayment.paid_at",
+    )
     late_fee_actions: Mapped[List["LateFeeAction"]] = relationship("LateFeeAction", foreign_keys="[LateFeeAction.invoice_id]", back_populates="invoice", cascade="all, delete-orphan")
+
+
+class InvoicePayment(SoftDeleteMixin, TimestampMixin, Base):
+    """Payment history rows against an invoice (supports partial payments)."""
+
+    __tablename__ = "invoice_payments"
+    __table_args__ = (
+        Index("ix_invoice_payments_invoice_paid_at", "invoice_id", "paid_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: f"pay_{uuid.uuid4().hex[:10]}",
+        index=True,
+    )
+    invoice_id: Mapped[str] = mapped_column(
+        ForeignKey("invoices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    amount_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    method: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    reference: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    recorded_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # pending | verified | rejected — amount_paid_paise uses verified only
+    status: Mapped[str] = mapped_column(String(20), default="verified", nullable=False, index=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    verified_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    proof_object_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    proof_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    proof_content_type: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
+    invoice: Mapped["Invoice"] = relationship("Invoice", back_populates="payments")
 
 
 class InvoiceAuditLog(SoftDeleteMixin, Base):
@@ -582,6 +849,8 @@ class InvoiceItem(SoftDeleteMixin, Base):
     # Per-line service: custom_dev | amc | advance | balance | hosting | …
     # Lets one invoice mix development + maintenance (and other) amounts.
     line_kind: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    hsn_sac: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    unit: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     # Relationship
     invoice: Mapped["Invoice"] = relationship("Invoice", back_populates="items")
@@ -596,7 +865,7 @@ class RecurringInvoice(SoftDeleteMixin, TimestampMixin, Base):
         default=lambda: f"rcr_{uuid.uuid4().hex[:10]}",
         index=True
     )
-    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="RESTRICT"), nullable=False, index=True)
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True
     )
@@ -831,6 +1100,12 @@ class Settings(SoftDeleteMixin, Base):
     invoice_sequences: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
     default_tax_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0.00, nullable=False)
     gst_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    gst_unregistered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    company_pan: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    company_state: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    company_state_code: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
+    invoice_terms_by_type: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    default_sac_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     pf_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     pf_employee_percent: Mapped[float] = mapped_column(Numeric(5, 2), default=0.00, nullable=False)
     esi_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -843,7 +1118,9 @@ class Settings(SoftDeleteMixin, Base):
     bank_account_number: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     bank_ifsc: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     bank_upi_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    bank_paypal_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     bank_upi_details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    bank_wire_instructions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     bank_upi_qr_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     smtp_host: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     smtp_port: Mapped[int] = mapped_column(Integer, default=587, nullable=False)
@@ -852,7 +1129,37 @@ class Settings(SoftDeleteMixin, Base):
     smtp_use_tls: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     smtp_from_name: Mapped[Optional[str]] = mapped_column(String(255), default="KR Web Solution", nullable=True)
     smtp_from_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # When False, scheduler / automatic invoice emails are skipped (manual Send still works).
+    smtp_auto_send_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     invoice_cc_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    company_logo_content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+
+class GstRegistration(SoftDeleteMixin, TimestampMixin, Base):
+    """Supplier GSTIN registrations with effective dates (multi-state support)."""
+
+    __tablename__ = "gst_registrations"
+    __table_args__ = (
+        Index("ix_gst_registrations_state_code", "state_code"),
+        Index("ix_gst_registrations_effective", "effective_from", "effective_to"),
+        Index("ix_gst_registrations_gstin", "gstin"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: f"gst_{uuid.uuid4().hex[:10]}",
+        index=True,
+    )
+    gstin: Mapped[str] = mapped_column(String(20), nullable=False)
+    legal_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    state_code: Mapped[str] = mapped_column(String(4), nullable=False)
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    effective_to: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
 class EmailTemplate(SoftDeleteMixin, Base):
@@ -1139,6 +1446,61 @@ class CompanyExpense(SoftDeleteMixin, TimestampMixin, Base):
     )
 
 
+class DeletedInvoice(Base):
+    """
+    Permanent archive of hard-deleted invoices for founder/admin DB reference.
+    No soft-delete; no product UI — query this table in SQL / admin tools only.
+    """
+
+    __tablename__ = "deleted_invoices"
+    __table_args__ = (
+        Index("ix_deleted_invoices_invoice_number", "invoice_number"),
+        Index("ix_deleted_invoices_deleted_at", "deleted_at"),
+        Index("ix_deleted_invoices_original_id", "original_invoice_id"),
+        Index("ix_deleted_invoices_client_id", "client_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: f"dinv_{uuid.uuid4().hex[:10]}",
+        index=True,
+    )
+    original_invoice_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    invoice_number: Mapped[str] = mapped_column(String(100), nullable=False)
+    invoice_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    ledger: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    client_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    client_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    project_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    project_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    issue_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    due_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    subtotal_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    tax_rate_percent: Mapped[float] = mapped_column(Numeric(5, 2), default=0.00, nullable=False)
+    tax_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    total_paise: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    gst_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Full invoice + items + payments + snapshot for founder reference
+    payload: Mapped[Any] = mapped_column(JSON, nullable=False, default=dict)
+    deleted_by: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    deleted_by_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    deleted_reason: Mapped[str] = mapped_column(
+        String(40), default="user_delete", nullable=False
+    )
+    deleted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    deleted_by_user: Mapped[Optional["User"]] = relationship(
+        "User", foreign_keys=[deleted_by]
+    )
+
+
 class AuditLog(Base):
     """Immutable change history — founder/admin only. No soft delete."""
 
@@ -1164,6 +1526,9 @@ class AuditLog(Base):
     changed_fields: Mapped[Any] = mapped_column(JSON, default=list, nullable=False)
     before: Mapped[Any] = mapped_column(JSON, nullable=True)
     after: Mapped[Any] = mapped_column(JSON, nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    project_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    client_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
