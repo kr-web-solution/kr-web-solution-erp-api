@@ -5,10 +5,10 @@ Requires CONFIRM_REMOTE_DB=YES CONFIRM_DB_NAME=<db> --i-know-this-is-remote
 from __future__ import annotations
 
 import asyncio
+import io
 import os
-import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from fastapi import UploadFile
@@ -18,27 +18,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.core.config import settings  # noqa: E402
-from app.core.database import AsyncSessionLocal, init_db  # noqa: E402
+from app.core.database import AsyncSessionLocal, init_db, not_deleted  # noqa: E402
 from app.core.db_target_guard import assert_migration_or_seed_allowed  # noqa: E402
-from app.models import Invoice  # noqa: E402
+from app.models import Client, Invoice, InvoicePayment  # noqa: E402
 from app.services.invoice_payment_proof import save_payment_proof  # noqa: E402
 
 TEMP = ROOT / "temp doc"
+CLIENT_NAME = "Redberyl Investment Managers LLP"
 
-# Map: invoice_number → (file, note with UTR)
+# Attach by issue date for Redberyl paid invoices (numbers are auto-allocated)
 ATTACHMENTS = [
     (
-        "KRWS-DEV-2026-019",
+        date(2026, 10, 14),
         TEMP / "image.png",
         "UTR 628768355511 — website 1st Payment (14 Oct 2026)",
     ),
     (
-        "KRWS-MIX-2026-001",
+        date(2026, 10, 22),
         TEMP / "image copy.png",
         "UTR 666121807956 — 2nd final payment website (22 Oct 2026)",
     ),
     (
-        "KRWS-MNT-2026-021",
+        date(2026, 11, 14),
         TEMP / "image copy 2.png",
         "UTR 631836999501 — website maintainance (14 Nov 2026)",
     ),
@@ -61,7 +62,6 @@ def _load_prod_env() -> str:
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         raise SystemExit("No DATABASE_URL in .env.production")
-    # Clear cached S3 client so new endpoint/keys apply
     try:
         from app.services import object_storage
 
@@ -77,18 +77,32 @@ async def main() -> None:
 
     await init_db()
     async with AsyncSessionLocal() as session:
-        for number, path, note in ATTACHMENTS:
+        client = (
+            await session.execute(
+                select(Client).where(Client.name == CLIENT_NAME, not_deleted(Client))
+            )
+        ).scalars().first()
+        if not client:
+            raise SystemExit(f"Client not found: {CLIENT_NAME}")
+
+        for issue_on, path, note in ATTACHMENTS:
             if not path.is_file():
                 print("MISSING", path)
                 continue
             inv = (
-                await session.execute(select(Invoice).where(Invoice.invoice_number == number))
+                await session.execute(
+                    select(Invoice).where(
+                        Invoice.client_id == client.id,
+                        Invoice.issue_date == issue_on,
+                        not_deleted(Invoice),
+                    )
+                )
             ).scalars().first()
             if not inv:
-                print("NOT_FOUND", number)
+                print("NOT_FOUND issue_date=", issue_on)
                 continue
-            data = path.read_bytes()
-            upload = UploadFile(filename=path.name, file=__import__("io").BytesIO(data))
+
+            upload = UploadFile(filename=path.name, file=io.BytesIO(path.read_bytes()))
             key, original, content_type, size = await save_payment_proof(inv.id, upload)
             inv.payment_proof_object_key = key
             inv.payment_proof_filename = original
@@ -97,9 +111,26 @@ async def main() -> None:
             inv.payment_proof_note = note
             if inv.status == "paid" and not inv.payment_verified_at:
                 inv.payment_verified_at = inv.paid_at or datetime.now(timezone.utc)
+
+            pay = (
+                await session.execute(
+                    select(InvoicePayment).where(
+                        InvoicePayment.invoice_id == inv.id,
+                        not_deleted(InvoicePayment),
+                    )
+                )
+            ).scalars().first()
+            if pay:
+                pay.proof_object_key = key
+                pay.proof_filename = original
+                pay.proof_content_type = content_type
+                pay.reference = note[:120]
+                pay.note = note
+
             print(
                 "attached",
-                number,
+                inv.invoice_number,
+                issue_on,
                 "→",
                 original,
                 f"({size} bytes)",

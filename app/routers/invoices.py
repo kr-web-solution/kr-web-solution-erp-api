@@ -11,6 +11,7 @@ from ..models import (
     Invoice,
     InvoiceItem,
     InvoicePayment,
+    Project,
     Settings,
     RecurringInvoice,
     User,
@@ -580,15 +581,19 @@ async def list_recurring_invoices(
 ):
     stmt = (
         select(RecurringInvoice)
+        .join(Project, Project.id == RecurringInvoice.project_id)
         .options(
             selectinload(RecurringInvoice.client),
             selectinload(RecurringInvoice.project),
         )
-        .where(not_deleted(RecurringInvoice))
+        .where(
+            not_deleted(RecurringInvoice),
+            not_deleted(Project),
+        )
         .order_by(RecurringInvoice.created_at.desc())
     )
     res = await db.execute(stmt)
-    recs = res.scalars().all()
+    recs = res.scalars().unique().all()
 
     output = []
     for r in recs:

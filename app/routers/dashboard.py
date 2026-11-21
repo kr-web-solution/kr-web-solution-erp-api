@@ -1,14 +1,14 @@
-from datetime import date, datetime, timezone
-from typing import List, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import List, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from ..core.dependencies import get_db, get_current_user, is_privileged
 from ..core.database import not_deleted
-from ..models import Project, Lead, Invoice, User, LateFeeAction, Client
+from ..models import Project, Lead, Invoice, InvoicePayment, User, LateFeeAction, Client
 from ..schemas import (
     DashboardResponse,
     RecentItem,
@@ -23,38 +23,130 @@ KOLKATA_TZ = ZoneInfo("Asia/Kolkata")
 _EXCLUDED_INVOICE_STATUSES = ("draft", "cancelled", "void")
 _LIVE_UNPAID_STATUSES = ("sent", "overdue")
 
+DashboardPeriod = Literal["week", "month", "6m", "1y", "full"]
+_VALID_PERIODS = ("week", "month", "6m", "1y", "full")
 
-def _last_six_month_keys(today: date) -> List[tuple[str, str, date, date]]:
-    """Return [(label, YYYY-MM, start, end_exclusive), ...] oldest → newest."""
-    months: List[tuple[str, str, date, date]] = []
-    y, m = today.year, today.month
-    for _ in range(6):
+# Bucket: (label, key, start_inclusive, end_exclusive)
+Bucket = Tuple[str, str, date, date]
+
+
+def _add_months(y: int, m: int, delta: int) -> tuple[int, int]:
+    idx = y * 12 + (m - 1) + delta
+    return idx // 12, idx % 12 + 1
+
+
+def _month_buckets(end: date, count: int) -> List[Bucket]:
+    """Last `count` calendar months ending at `end`'s month. Oldest → newest."""
+    months: List[Bucket] = []
+    y, m = end.year, end.month
+    for _ in range(count):
         start = date(y, m, 1)
-        if m == 12:
-            end = date(y + 1, 1, 1)
-        else:
-            end = date(y, m + 1, 1)
-        label = start.strftime("%b")
-        key = start.strftime("%Y-%m")
-        months.append((label, key, start, end))
-        if m == 1:
-            y, m = y - 1, 12
-        else:
-            m -= 1
+        ny, nm = _add_months(y, m, 1)
+        end_ex = date(ny, nm, 1)
+        months.append((start.strftime("%b"), start.strftime("%Y-%m"), start, end_ex))
+        y, m = _add_months(y, m, -1)
     months.reverse()
     return months
 
 
-async def _revenue_by_month(
+def _day_buckets(start: date, end_inclusive: date) -> List[Bucket]:
+    buckets: List[Bucket] = []
+    d = start
+    while d <= end_inclusive:
+        buckets.append((d.strftime("%d %b"), d.strftime("%Y-%m-%d"), d, d + timedelta(days=1)))
+        d += timedelta(days=1)
+    return buckets
+
+
+async def _earliest_invoice_date(
+    db: AsyncSession, *, client_id: Optional[str] = None
+) -> Optional[date]:
+    stmt = select(func.min(Invoice.issue_date)).where(
+        not_deleted(Invoice),
+        Invoice.status.notin_(_EXCLUDED_INVOICE_STATUSES),
+    )
+    if client_id:
+        stmt = stmt.where(Invoice.client_id == client_id)
+    return await db.scalar(stmt)
+
+
+async def _period_buckets(
     db: AsyncSession,
     today: date,
+    period: DashboardPeriod,
     *,
     client_id: Optional[str] = None,
-) -> List[RevenueMonthPoint]:
-    """Billed = non-draft invoices by issue_date; collected = paid by paid_at (IST)."""
-    window = _last_six_month_keys(today)
+) -> tuple[str, List[Bucket]]:
+    """Return (grain, buckets) where grain is 'day' or 'month'."""
+    if period == "week":
+        start = today - timedelta(days=6)
+        return "day", _day_buckets(start, today)
+    if period == "month":
+        start = date(today.year, today.month, 1)
+        return "day", _day_buckets(start, today)
+    if period == "6m":
+        return "month", _month_buckets(today, 6)
+    if period == "1y":
+        return "month", _month_buckets(today, 12)
+    # full — monthly from earliest invoice (or last 12 months if empty)
+    earliest = await _earliest_invoice_date(db, client_id=client_id)
+    if earliest is None:
+        return "month", _month_buckets(today, 12)
+    start_month = date(earliest.year, earliest.month, 1)
+    months: List[Bucket] = []
+    y, m = start_month.year, start_month.month
+    while True:
+        start = date(y, m, 1)
+        if start > date(today.year, today.month, 1):
+            break
+        ny, nm = _add_months(y, m, 1)
+        end_ex = date(ny, nm, 1)
+        label = start.strftime("%b %y") if (today.year - earliest.year) >= 1 else start.strftime("%b")
+        months.append((label, start.strftime("%Y-%m"), start, end_ex))
+        y, m = ny, nm
+    return "month", months or _month_buckets(today, 1)
+
+
+def _bucket_key(when: date, grain: str) -> str:
+    return when.strftime("%Y-%m-%d") if grain == "day" else when.strftime("%Y-%m")
+
+
+def _period_label(period: DashboardPeriod, today: date, window: List[Bucket]) -> str:
+    if not window:
+        return "No range"
+    start, end_ex = window[0][2], window[-1][3]
+    end = end_ex - timedelta(days=1)
+    if period == "week":
+        return f"{start.day} {start.strftime('%b')}–{end.day} {end.strftime('%b %Y')}"
+    if period == "month":
+        return today.strftime("%b %Y")  # e.g. Nov 2026
+    if period in ("6m", "1y"):
+        return f"{start.strftime('%b %Y')}–{end.strftime('%b %Y')}"
+    return "All time"
+
+
+def _to_ist_date(value: Optional[datetime], fallback: Optional[date] = None) -> Optional[date]:
+    if value is None:
+        return fallback
+    if getattr(value, "tzinfo", None) is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(KOLKATA_TZ).date()
+
+
+async def _revenue_by_period(
+    db: AsyncSession,
+    today: date,
+    period: DashboardPeriod = "6m",
+    *,
+    client_id: Optional[str] = None,
+) -> tuple[List[RevenueMonthPoint], str, int, int]:
+    """Billed by invoice issue_date; collected by verified payment paid_at (IST)."""
+    grain, window = await _period_buckets(db, today, period, client_id=client_id)
+    if not window:
+        return [], _period_label(period, today, []), 0, 0
     range_start = window[0][2]
     range_end = window[-1][3]
+    label = _period_label(period, today, window)
 
     billed_map = {key: 0 for _, key, _, _ in window}
     collected_map = {key: 0 for _, key, _, _ in window}
@@ -70,47 +162,57 @@ async def _revenue_by_month(
     for issue_date, total in (await db.execute(billed_stmt)).all():
         if not issue_date:
             continue
-        key = issue_date.strftime("%Y-%m")
+        key = _bucket_key(issue_date, grain)
         if key in billed_map:
             billed_map[key] += int(total or 0)
 
-    paid_stmt = select(Invoice.paid_at, Invoice.issue_date, Invoice.total_paise).where(
-        not_deleted(Invoice),
-        Invoice.status == "paid",
+    # Collected = money actually received in the window (payment date), not invoice issue date
+    pay_stmt = (
+        select(InvoicePayment.paid_at, InvoicePayment.amount_paise, Invoice.issue_date)
+        .join(Invoice, Invoice.id == InvoicePayment.invoice_id)
+        .where(
+            not_deleted(InvoicePayment),
+            not_deleted(Invoice),
+            InvoicePayment.status == "verified",
+            Invoice.status.notin_(_EXCLUDED_INVOICE_STATUSES),
+        )
     )
     if client_id:
-        paid_stmt = paid_stmt.where(Invoice.client_id == client_id)
-    for paid_at, issue_date, total in (await db.execute(paid_stmt)).all():
-        when = None
-        if paid_at is not None:
-            if getattr(paid_at, "tzinfo", None) is None:
-                paid_at = paid_at.replace(tzinfo=timezone.utc)
-            when = paid_at.astimezone(KOLKATA_TZ).date()
-        elif issue_date is not None:
-            when = issue_date
+        pay_stmt = pay_stmt.where(Invoice.client_id == client_id)
+    for paid_at, amount, issue_date in (await db.execute(pay_stmt)).all():
+        when = _to_ist_date(paid_at, fallback=issue_date)
         if when is None or when < range_start or when >= range_end:
             continue
-        key = when.strftime("%Y-%m")
+        key = _bucket_key(when, grain)
         if key in collected_map:
-            collected_map[key] += int(total or 0)
+            collected_map[key] += int(amount or 0)
 
-    return [
+    points = [
         RevenueMonthPoint(
-            month=label,
+            month=lbl,
             year_month=key,
             billed_paise=billed_map[key],
             collected_paise=collected_map[key],
         )
-        for label, key, _, _ in window
+        for lbl, key, _, _ in window
     ]
+    billed_total = sum(p.billed_paise for p in points)
+    collected_total = sum(p.collected_paise for p in points)
+    return points, label, billed_total, collected_total
+
 
 @router.get("", response_model=DashboardResponse)
 async def get_dashboard_summary(
+    period: str = Query("month", description="week | month | 6m | 1y | full"),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     today = datetime.now(KOLKATA_TZ).date()
+    period_key: DashboardPeriod = period if period in _VALID_PERIODS else "month"  # type: ignore[assignment]
     revenue_by_month: List[RevenueMonthPoint] = []
+    period_label = _period_label(period_key, today, [])
+    billed_paise = 0
+    collected_paise = 0
 
     if current_user.role == "worker":
         # Worker: only assigned projects
@@ -214,7 +316,9 @@ async def get_dashboard_summary(
             )
             for inv in recent_invoices
         ]
-        revenue_by_month = await _revenue_by_month(db, today, client_id=client_id)
+        revenue_by_month, period_label, billed_paise, collected_paise = await _revenue_by_period(
+            db, today, period_key, client_id=client_id
+        )
 
     elif not is_privileged(current_user.role):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
@@ -353,7 +457,9 @@ async def get_dashboard_summary(
 
         all_recent.sort(key=lambda x: x.date, reverse=True)
         recent_items = all_recent[:5]
-        revenue_by_month = await _revenue_by_month(db, today)
+        revenue_by_month, period_label, billed_paise, collected_paise = await _revenue_by_period(
+            db, today, period_key
+        )
 
     return DashboardResponse(
         running_projects_count=running_projects_count,
@@ -364,5 +470,9 @@ async def get_dashboard_summary(
         recent_items=recent_items,
         needs_action_invoices=needs_action_invoices,
         revenue_by_month=revenue_by_month,
+        period=period_key,
+        period_label=period_label,
+        billed_paise=billed_paise,
+        collected_paise=collected_paise,
     )
 

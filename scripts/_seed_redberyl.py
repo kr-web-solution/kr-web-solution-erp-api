@@ -25,6 +25,7 @@ from app.models import (  # noqa: E402
     Client,
     Invoice,
     InvoiceItem,
+    InvoicePayment,
     Project,
     ProjectDocument,
     RecurringInvoice,
@@ -70,16 +71,21 @@ async def _create_paid_invoice(
     inv = Invoice(
         invoice_number="",
         invoice_type=header_type,
+        invoice_type_id=f"itp_{header_type}"[:36],
         ledger=ledger,
+        ledger_id=f"ild_{ledger}"[:36] if ledger in ("development", "maintenance") else None,
         client_id=client_id,
         project_id=project_id,
         status="paid",
+        status_id="ist_paid",
         issue_date=issue_date,
         due_date=issue_date,
         subtotal_paise=subtotal,
         tax_rate_percent=0,
         tax_paise=0,
         total_paise=subtotal,
+        gst_enabled=False,
+        amount_paid_paise=subtotal,
         notes=notes,
         period_months=period_months,
         covers_from=covers_from,
@@ -94,6 +100,7 @@ async def _create_paid_invoice(
         invoice_type=number_hint,
         issue_date=issue_date,
         settings_row=st,
+        gst_enabled=False,
     )
     for i in items:
         amt = int(round(float(i["quantity"]) * int(i["unit_rate_paise"])))
@@ -108,8 +115,20 @@ async def _create_paid_invoice(
                     i.get("line_kind"),
                     header_type if header_type != "mixed" else "custom_dev",
                 ),
+                unit="Nos",
             )
         )
+    session.add(
+        InvoicePayment(
+            invoice_id=inv.id,
+            amount_paise=subtotal,
+            method="upi",
+            paid_at=paid_at,
+            note=notes or "Historical Redberyl payment",
+            status="verified",
+            verified_at=paid_at,
+        )
+    )
     return inv
 
 

@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.core.database import AsyncSessionLocal as TestingSessionLocal
 from app.models import Invoice
-from app.routers.dashboard import _revenue_by_month
+from app.routers.dashboard import _revenue_by_period
 from app.services.client_project import create_project
 from app.services.project_money import summarize_invoices
 from tests.test_client_project_rules import _make_client
@@ -83,9 +83,11 @@ async def test_project_money_and_revenue_ignore_void_and_soft_deleted():
         )
         assert int(unpaid) == 50_000
 
-        points = await _revenue_by_month(session, date.today(), client_id=cid)
-        billed = sum(p.billed_paise for p in points)
+        points, _label, billed, _collected = await _revenue_by_period(
+            session, date.today(), "month", client_id=cid
+        )
         assert billed == 50_000
+        assert sum(p.billed_paise for p in points) == 50_000
 
 
 def test_dashboard_unchanged_when_only_void_or_soft_added(client: TestClient, founder_cookies):

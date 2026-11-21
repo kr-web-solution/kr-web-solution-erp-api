@@ -372,22 +372,32 @@ async def count_project_children(db: AsyncSession, project_id: str) -> Dict[str,
 
 
 async def delete_project(db: AsyncSession, project_id: str) -> Project:
-    """Soft-delete a project only when it has zero invoices and zero plans."""
+    """Soft-delete a project; cascades soft-delete of its recurring maintenance plans.
+
+    Invoices are kept (AR history) — delete is blocked while live invoices remain.
+    """
     project = await get_project_or_404(db, project_id, for_update=True)
     counts = await count_project_children(db, project_id)
     inv_n = counts["invoice_count"]
-    plan_n = counts["plan_count"]
-    if inv_n > 0 or plan_n > 0:
-        parts = []
-        if inv_n > 0:
-            parts.append(f"{inv_n} invoice(s)")
-        if plan_n > 0:
-            parts.append(f"{plan_n} recurring maintenance plan(s)")
+    if inv_n > 0:
         raise ConflictException(
-            f"Cannot delete project. Delete its {' and '.join(parts)} first.",
+            f"Cannot delete project. Delete its {inv_n} invoice(s) first.",
             invoice_count=inv_n,
-            plan_count=plan_n,
+            plan_count=counts["plan_count"],
         )
+
+    # Cascade: remove maintenance plans with the project
+    plans = (
+        await db.execute(
+            select(RecurringInvoice).where(
+                RecurringInvoice.project_id == project_id,
+                not_deleted(RecurringInvoice),
+            )
+        )
+    ).scalars().all()
+    for plan in plans:
+        plan.active = False
+        plan.soft_delete()
 
     project.soft_delete()
     await db.flush()

@@ -1210,6 +1210,25 @@ def _phase_notes_for_response(
     ]
 
 
+def _delivery_detail_from_project(
+    project: Project,
+    current_user: User,
+) -> ProjectDeliveryDetailResponse:
+    base = sanitize_project_for_role(project, current_user.role)
+    all_items = list(project.checklist_items or [])
+    items = all_items
+    show_notes = current_user.role != "client"
+    if current_user.role == "client":
+        # Clients see phase progress only — no internal checklist ticks / notes
+        items = []
+    return ProjectDeliveryDetailResponse(
+        **base.model_dump(),
+        checklist_items=[ProjectChecklistItemResponse.model_validate(i) for i in items],
+        checklist_progress_percent=checklist_progress(all_items, project.delivery_phase),
+        phase_notes=_phase_notes_for_response(project, include=show_notes),
+    )
+
+
 async def _delivery_detail_response(
     project_id: str,
     db: AsyncSession,
@@ -1221,20 +1240,7 @@ async def _delivery_detail_response(
         selectinload(Project.checklist_items),
         selectinload(Project.phase_notes),
     )
-    base = sanitize_project_for_role(project, current_user.role)
-    items = list(project.checklist_items or [])
-    show_notes = current_user.role != "client"
-    if current_user.role == "client":
-        # Clients see phase progress only — no internal checklist ticks / notes
-        items = []
-    return ProjectDeliveryDetailResponse(
-        **base.model_dump(),
-        checklist_items=[ProjectChecklistItemResponse.model_validate(i) for i in items],
-        checklist_progress_percent=checklist_progress(
-            list(project.checklist_items or []), project.delivery_phase
-        ),
-        phase_notes=_phase_notes_for_response(project, include=show_notes),
-    )
+    return _delivery_detail_from_project(project, current_user)
 
 
 @router.get("/{project_id}/delivery", response_model=ProjectDeliveryDetailResponse)
@@ -1243,11 +1249,20 @@ async def get_project_delivery(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = await _load_project(db, project_id, selectinload(Project.checklist_items))
+    # Single load: checklist + notes only (no second round-trip / no empty commit).
+    project = await _load_project(
+        db,
+        project_id,
+        selectinload(Project.checklist_items),
+        selectinload(Project.phase_notes),
+    )
     await _assert_project_access(project, current_user, db=db)
-    await ensure_project_checklist(db, project, done_through_stage=0)
-    await db.commit()
-    return await _delivery_detail_response(project_id, db, current_user)
+    seeded = await ensure_project_checklist(db, project, done_through_stage=0)
+    if seeded:
+        await db.commit()
+        # Collection was empty at load time — reload seeded rows once.
+        await db.refresh(project, attribute_names=["checklist_items"])
+    return _delivery_detail_from_project(project, current_user)
 
 
 @router.patch(
@@ -1312,7 +1327,13 @@ async def toggle_project_checklist(
 ):
     if current_user.role == "client":
         raise HTTPException(status_code=403, detail="Clients cannot update delivery checklist")
-    project = await _load_project(db, project_id, selectinload(Project.checklist_items))
+    # Load notes once so we can return without a second full project fetch.
+    project = await _load_project(
+        db,
+        project_id,
+        selectinload(Project.checklist_items),
+        selectinload(Project.phase_notes),
+    )
     await _assert_project_access(project, current_user, db=db)
     item = next((i for i in project.checklist_items if i.id == item_id), None)
     if not item:
@@ -1352,9 +1373,10 @@ async def toggle_project_checklist(
         after={"is_done": item.is_done, "project_id": project.id},
         request=None,
     )
-    await sync_engagement_from_project(db, project)
+    # Phase is unchanged on toggle — skip engagement sync (runs on advance/regress).
+    resp = _delivery_detail_from_project(project, current_user)
     await db.commit()
-    return await get_project_delivery(project_id, db, current_user)
+    return resp
 
 
 @router.post("/{project_id}/delivery/advance", response_model=ProjectDeliveryDetailResponse)
@@ -1366,7 +1388,12 @@ async def advance_project_delivery(
 ):
     if current_user.role == "client":
         raise HTTPException(status_code=403, detail="Forbidden")
-    project = await _load_project(db, project_id, selectinload(Project.checklist_items))
+    project = await _load_project(
+        db,
+        project_id,
+        selectinload(Project.checklist_items),
+        selectinload(Project.phase_notes),
+    )
     await _assert_project_access(project, current_user, db=db)
 
     phase = project.delivery_phase or DELIVERY_MIN_STAGE
@@ -1386,8 +1413,9 @@ async def advance_project_delivery(
                     reason="Delivery complete at maintenance phase",
                 )
             await sync_engagement_from_project(db, project)
+            resp = _delivery_detail_from_project(project, current_user)
             await db.commit()
-            return await get_project_delivery(project_id, db, current_user)
+            return resp
         raise HTTPException(status_code=400, detail="Already at maintenance phase")
 
     if phase == HANDOVER_PHASE:
@@ -1412,13 +1440,15 @@ async def advance_project_delivery(
                     reason="Closed without AMC at handover",
                 )
             await sync_engagement_from_project(db, project)
+            resp = _delivery_detail_from_project(project, current_user)
             await db.commit()
-            return await get_project_delivery(project_id, db, current_user)
+            return resp
 
     project.delivery_phase = min(phase + 1, DELIVERY_MAX_STAGE)
     await sync_engagement_from_project(db, project)
+    resp = _delivery_detail_from_project(project, current_user)
     await db.commit()
-    return await get_project_delivery(project_id, db, current_user)
+    return resp
 
 
 @router.post("/{project_id}/delivery/regress", response_model=ProjectDeliveryDetailResponse)
@@ -1428,7 +1458,12 @@ async def regress_project_delivery(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_founder_ceo),
 ):
-    project = await _load_project(db, project_id, selectinload(Project.checklist_items))
+    project = await _load_project(
+        db,
+        project_id,
+        selectinload(Project.checklist_items),
+        selectinload(Project.phase_notes),
+    )
     if project.delivery_phase <= DELIVERY_MIN_STAGE:
         raise HTTPException(status_code=400, detail="Already at requirement analysis phase")
     project.delivery_phase -= 1
@@ -1442,8 +1477,9 @@ async def regress_project_delivery(
             reason=reopen_reason or "Delivery phase regress from completed",
         )
     await sync_engagement_from_project(db, project)
+    resp = _delivery_detail_from_project(project, current_user)
     await db.commit()
-    return await get_project_delivery(project_id, db, current_user)
+    return resp
 
 
 # ---------- Additional features + docs ----------

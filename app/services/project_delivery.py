@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -35,15 +35,21 @@ def seed_project_checklist(project_id: str, done_through_stage: int = 0) -> List
     return rows
 
 
-async def ensure_project_checklist(db: AsyncSession, project: Project, done_through_stage: int = 0) -> None:
+async def ensure_project_checklist(db: AsyncSession, project: Project, done_through_stage: int = 0) -> bool:
+    """Seed delivery checklist if missing. Returns True when rows were inserted."""
+    # Prefer already-loaded collection to avoid an extra round-trip on every Delivery open.
+    unloaded = sa_inspect(project).unloaded
+    if "checklist_items" not in unloaded and project.checklist_items:
+        return False
     existing = (
         await db.execute(select(ProjectChecklistItem).where(ProjectChecklistItem.project_id == project.id).limit(1))
     ).scalars().first()
     if existing:
-        return
+        return False
     for item in seed_project_checklist(project.id, done_through_stage=done_through_stage):
         db.add(item)
     await db.flush()
+    return True
 
 
 async def sync_engagement_from_project(db: AsyncSession, project: Project) -> None:
@@ -79,9 +85,18 @@ async def sync_engagement_from_project(db: AsyncSession, project: Project) -> No
 
     # Mirror checklist done flags for stages <= delivery_phase on engagement delivery items
     phase = project.delivery_phase
-    proj_items = (
-        await db.execute(select(ProjectChecklistItem).where(ProjectChecklistItem.project_id == project.id))
-    ).scalars().all()
+    # Reuse in-memory checklist when already loaded (toggle/advance path).
+    unloaded = sa_inspect(project).unloaded
+    if "checklist_items" not in unloaded:
+        proj_items = list(project.checklist_items or [])
+    else:
+        proj_items = list(
+            (
+                await db.execute(
+                    select(ProjectChecklistItem).where(ProjectChecklistItem.project_id == project.id)
+                )
+            ).scalars().all()
+        )
     done_keys = {(i.stage_number, i.item_key) for i in proj_items if i.is_done or i.stage_number < phase}
 
     for item in eng.checklist_items or []:

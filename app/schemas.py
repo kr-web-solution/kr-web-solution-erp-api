@@ -1210,6 +1210,11 @@ class DashboardResponse(BaseModel):
     recent_items: List[RecentItem] = []
     needs_action_invoices: List[LateFeeActionResponse] = []
     revenue_by_month: List[RevenueMonthPoint] = []
+    # Period filter echo + totals (billed by issue_date, collected by payment paid_at IST)
+    period: str = "month"
+    period_label: str = "This month"
+    billed_paise: int = 0
+    collected_paise: int = 0
 
 
 # ----------------- Staff / Worker management -----------------
