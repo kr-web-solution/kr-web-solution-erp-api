@@ -2,7 +2,7 @@ from datetime import date, datetime, timezone, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, inspect as sa_inspect
+from sqlalchemy import select, func, or_, and_, inspect as sa_inspect
 from sqlalchemy.orm import selectinload
 
 from ..core.dependencies import get_db, get_current_user, require_founder_ceo, is_privileged
@@ -31,6 +31,8 @@ from ..services.invoice_status import (
 )
 from ..schemas import (
     InvoiceResponse,
+    InvoiceListItem,
+    InvoiceListResponse,
     InvoiceCreate,
     InvoiceUpdate,
     InvoiceItemResponse,
@@ -44,6 +46,15 @@ from ..schemas import (
     LateFeeDecisionRequest,
     CreditNoteCreate,
     DebitNoteCreate,
+    OptionsResponse,
+    OptionItemSchema,
+)
+from ..services.pagination import (
+    build_envelope,
+    clamp_options_limit,
+    clamp_page,
+    clamp_page_size,
+    offset_for,
 )
 from ..services.invoice_payments import (
     assert_payment_mutable,
@@ -167,6 +178,95 @@ def _loaded_parent_invoice(inv: Invoice) -> Optional[Invoice]:
     return getattr(inv, "parent_invoice", None)
 
 
+def _invoice_effective_status(inv: Invoice, *, today: Optional[date] = None) -> str:
+    """Match list SQL overdue predicate and detail formatting."""
+    today = today or date.today()
+    effective = inv.status
+    if effective == "sent" and inv.due_date and inv.due_date < today:
+        return "overdue"
+    return effective
+
+
+def _sql_overdue_predicate(today: Optional[date] = None):
+    today = today or date.today()
+    return and_(Invoice.status == "sent", Invoice.due_date.isnot(None), Invoice.due_date < today)
+
+
+def _sql_sent_not_overdue_predicate(today: Optional[date] = None):
+    today = today or date.today()
+    return and_(
+        Invoice.status == "sent",
+        or_(Invoice.due_date.is_(None), Invoice.due_date >= today),
+    )
+
+
+def format_invoice_list_item(
+    inv: Invoice,
+    settings: Optional[Settings] = None,
+    *,
+    can_delete: bool = False,
+) -> InvoiceListItem:
+    """Slim row for paginated invoice tables."""
+    from ..services.invoice_snapshot import document_details_are_locked, get_snapshot
+    from ..services.tax_payroll import gst_is_enabled
+
+    today = date.today()
+    effective_status = _invoice_effective_status(inv, today=today)
+    amount_paid = int(getattr(inv, "amount_paid_paise", 0) or 0)
+    total = int(inv.total_paise or 0)
+    if effective_status == "paid" and amount_paid <= 0 and total > 0:
+        amount_paid = total
+    balance_due = max(0, total - amount_paid)
+    if effective_status in ("paid", "cancelled", "void") or inv.invoice_type == "credit_note":
+        if effective_status == "paid":
+            balance_due = 0
+
+    client = getattr(inv, "client", None)
+    project = getattr(inv, "project", None)
+    snap = get_snapshot(inv)
+    doc_locked = document_details_are_locked(inv)
+    snap_client = (snap or {}).get("client") if isinstance(snap, dict) else None
+    use_snap_client = bool(doc_locked and isinstance(snap_client, dict))
+
+    inv_gst_override = getattr(inv, "gst_enabled", None)
+    live_gst = gst_is_enabled(settings) if settings else False
+    if inv_gst_override is not None:
+        effective_gst = bool(inv_gst_override)
+    else:
+        effective_gst = live_gst
+
+    return InvoiceListItem(
+        id=inv.id,
+        invoice_number=inv.invoice_number,
+        invoice_type=inv.invoice_type,
+        ledger=getattr(inv, "ledger", None) or "development",
+        client_id=inv.client_id,
+        client_name=(snap_client or {}).get("name")
+        if use_snap_client
+        else (client.name if client else None),
+        project_id=inv.project_id,
+        project_name=(
+            (snap.get("project") or {}).get("name")
+            if doc_locked and snap
+            else (project.name if project else None)
+        ),
+        status=effective_status,
+        issue_date=inv.issue_date,
+        due_date=inv.due_date,
+        subtotal_paise=int(inv.subtotal_paise or 0),
+        tax_paise=int(inv.tax_paise or 0),
+        total_paise=total,
+        amount_paid_paise=amount_paid,
+        balance_due_paise=balance_due,
+        has_payment_proof=bool(getattr(inv, "payment_proof_object_key", None)),
+        email_status=getattr(inv, "email_status", None) or "pending",
+        created_at=inv.created_at,
+        can_delete=can_delete,
+        document_locked=doc_locked,
+        gst_enabled=effective_gst,
+    )
+
+
 def format_invoice_response(
     inv: Invoice,
     settings: Optional[Settings] = None,
@@ -176,9 +276,7 @@ def format_invoice_response(
     can_delete: bool = False,
 ) -> InvoiceResponse:
     # Query-time overdue calculation
-    effective_status = inv.status
-    if effective_status == "sent" and inv.due_date and inv.due_date < date.today():
-        effective_status = "overdue"
+    effective_status = _invoice_effective_status(inv)
 
     amount_paid = int(getattr(inv, "amount_paid_paise", 0) or 0)
     total = int(inv.total_paise or 0)
@@ -528,51 +626,233 @@ def _assert_invoice_access(inv: Invoice, user: User) -> None:
 
 # ----------------- Invoices -----------------
 
-@router.get("", response_model=List[InvoiceResponse])
+def _invoice_list_base_filters(
+    stmt,
+    *,
+    current_user: User,
+    type_filter: Optional[str],
+    client_id: Optional[str],
+    project_id: Optional[str],
+    search: Optional[str],
+    status_filter: Optional[str],
+    today: date,
+):
+    """Apply shared WHERE clauses for invoice list + counts (SQL overdue)."""
+    stmt = stmt.where(not_deleted(Invoice))
+
+    if current_user.role == "client":
+        if not current_user.client_id:
+            return stmt.where(Invoice.id == None)  # noqa: E711 — empty result
+        stmt = stmt.where(Invoice.client_id == current_user.client_id, Invoice.status != "draft")
+
+    if type_filter and type_filter != "all":
+        stmt = stmt.where(Invoice.invoice_type == type_filter)
+    if client_id:
+        stmt = stmt.where(Invoice.client_id == client_id)
+    if project_id:
+        stmt = stmt.where(Invoice.project_id == project_id)
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Invoice.invoice_number.ilike(term),
+                Invoice.notes.ilike(term),
+            )
+        )
+
+    if status_filter and status_filter != "all":
+        if status_filter == "overdue":
+            stmt = stmt.where(_sql_overdue_predicate(today))
+        elif status_filter == "sent":
+            stmt = stmt.where(_sql_sent_not_overdue_predicate(today))
+        else:
+            stmt = stmt.where(Invoice.status == status_filter)
+
+    return stmt
+
+
+@router.get("", response_model=InvoiceListResponse)
 async def list_invoices(
     status_filter: Optional[str] = Query(None, alias="status"),
     type_filter: Optional[str] = Query(None, alias="type"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    sort_by: Optional[str] = Query(None),
+    sort_order: Optional[str] = Query("desc"),
+    client_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    include_counts: bool = Query(False),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     if current_user.role == "worker":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workers cannot view invoices")
     if current_user.role != "client" and not is_privileged(current_user.role):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-    stmt = (
-        select(Invoice)
-        .options(selectinload(Invoice.client), selectinload(Invoice.project), selectinload(Invoice.items))
-        .where(not_deleted(Invoice))
-        .order_by(Invoice.created_at.desc())
+    today = date.today()
+    page = clamp_page(page)
+    page_size = clamp_page_size(page_size)
+
+    sort_map = {
+        "created_at": Invoice.created_at,
+        "issue_date": Invoice.issue_date,
+        "due_date": Invoice.due_date,
+        "invoice_number": Invoice.invoice_number,
+        "total_paise": Invoice.total_paise,
+        "status": Invoice.status,
+    }
+    sort_col = sort_map.get((sort_by or "created_at").strip(), Invoice.created_at)
+    order = sort_col.asc() if (sort_order or "desc").lower() == "asc" else sort_col.desc()
+
+    base = select(Invoice)
+    base = _invoice_list_base_filters(
+        base,
+        current_user=current_user,
+        type_filter=type_filter,
+        client_id=client_id,
+        project_id=project_id,
+        search=search,
+        status_filter=status_filter,
+        today=today,
     )
 
-    if current_user.role == "client":
-        if not current_user.client_id:
-            return []
-        # Client only sees own invoices, and MUST NEVER see draft invoices
-        stmt = stmt.where(Invoice.client_id == current_user.client_id, Invoice.status != "draft")
+    count_stmt = select(func.count()).select_from(base.order_by(None).subquery())
+    total_items = int(await db.scalar(count_stmt) or 0)
 
-    if type_filter and type_filter != "all":
-        stmt = stmt.where(Invoice.invoice_type == type_filter)
-
+    stmt = (
+        base.options(selectinload(Invoice.client), selectinload(Invoice.project))
+        .order_by(order)
+        .offset(offset_for(page, page_size))
+        .limit(page_size)
+    )
     res = await db.execute(stmt)
-    invoices = res.scalars().all()
+    invoices = res.scalars().unique().all()
     st = await _load_settings(db)
 
     from ..services.invoice_numbers import can_delete_with_tips, live_series_tips
 
     tips = await live_series_tips(db)
-    formatted = [
-        format_invoice_response(
-            inv, st, can_delete=can_delete_with_tips(inv, tips)
-        )
+    items = [
+        format_invoice_list_item(inv, st, can_delete=can_delete_with_tips(inv, tips))
         for inv in invoices
     ]
-    if status_filter and status_filter != "all":
-        formatted = [inv for inv in formatted if inv.status == status_filter]
 
-    return formatted
+    envelope = build_envelope(items, page=page, page_size=page_size, total_items=total_items)
+    out = InvoiceListResponse(**envelope)
+
+    if include_counts:
+        # Counts/totals share role/type/client/project/search filters but ignore status tab.
+        from ..schemas import InvoiceMoneyTotalsSchema
+
+        counts_base = select(
+            Invoice.id, Invoice.status, Invoice.due_date, Invoice.total_paise
+        ).where(not_deleted(Invoice))
+        if current_user.role == "client":
+            if not current_user.client_id:
+                out.status_counts = {"all": 0}
+                out.money_totals = InvoiceMoneyTotalsSchema()
+                return out
+            counts_base = counts_base.where(
+                Invoice.client_id == current_user.client_id, Invoice.status != "draft"
+            )
+        if type_filter and type_filter != "all":
+            counts_base = counts_base.where(Invoice.invoice_type == type_filter)
+        if client_id:
+            counts_base = counts_base.where(Invoice.client_id == client_id)
+        if project_id:
+            counts_base = counts_base.where(Invoice.project_id == project_id)
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            counts_base = counts_base.where(
+                or_(Invoice.invoice_number.ilike(term), Invoice.notes.ilike(term))
+            )
+        rows = (await db.execute(counts_base)).all()
+        counts: dict[str, int] = {
+            "all": 0,
+            "draft": 0,
+            "sent": 0,
+            "overdue": 0,
+            "paid": 0,
+            "cancelled": 0,
+            "void": 0,
+            "proof_pending": 0,
+        }
+        billed = paid = unpaid = 0
+        for _id, st_raw, due, total in rows:
+            counts["all"] += 1
+            amount = int(total or 0)
+            billed += amount
+            eff = st_raw
+            if st_raw == "sent" and due and due < today:
+                eff = "overdue"
+            if eff in counts:
+                counts[eff] += 1
+            else:
+                counts[eff] = counts.get(eff, 0) + 1
+            if eff == "paid":
+                paid += amount
+            elif eff in ("sent", "overdue", "proof_pending"):
+                unpaid += amount
+        out.status_counts = counts
+        out.money_totals = InvoiceMoneyTotalsSchema(
+            billed_paise=billed, paid_paise=paid, unpaid_paise=unpaid
+        )
+
+    return out
+
+
+@router.get("/options", response_model=OptionsResponse)
+async def list_invoice_options(
+    search: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+    client_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Picker catalog — id + label only (Stage 3)."""
+    if current_user.role == "worker":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workers cannot view invoices")
+    if current_user.role != "client" and not is_privileged(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    lim = clamp_options_limit(limit)
+    stmt = (
+        select(Invoice)
+        .options(selectinload(Invoice.client))
+        .where(not_deleted(Invoice))
+        .order_by(Invoice.created_at.desc())
+        .limit(lim)
+    )
+    if current_user.role == "client":
+        if not current_user.client_id:
+            return OptionsResponse(items=[])
+        stmt = stmt.where(Invoice.client_id == current_user.client_id, Invoice.status != "draft")
+    if client_id:
+        stmt = stmt.where(Invoice.client_id == client_id)
+    if project_id:
+        stmt = stmt.where(Invoice.project_id == project_id)
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        stmt = stmt.where(Invoice.invoice_number.ilike(term))
+
+    res = await db.execute(stmt)
+    rows = res.scalars().unique().all()
+    items = [
+        OptionItemSchema(
+            id=inv.id,
+            label=inv.invoice_number,
+            meta={
+                "client_name": inv.client.name if inv.client else None,
+                "status": _invoice_effective_status(inv),
+                "total_paise": int(inv.total_paise or 0),
+            },
+        )
+        for inv in rows
+    ]
+    return OptionsResponse(items=items)
 
 @router.get("/recurring", response_model=List[RecurringInvoiceResponse])
 async def list_recurring_invoices(

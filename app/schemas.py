@@ -187,6 +187,8 @@ class ClientResponse(ClientBase, OrmBase):
     updated_at: datetime
     projects_count: Optional[int] = 0
     invoices_count: Optional[int] = 0
+    # Sum of total_paise for unpaid live invoices (status sent/overdue in DB).
+    outstanding_paise: Optional[int] = 0
 
 # ----------------- Leads -----------------
 class LeadBase(BaseModel):
@@ -778,6 +780,77 @@ class InvoiceResponse(OrmBase):
     gst_unregistered: bool = False
     default_sac_code: Optional[str] = None
     payment_terms: Optional[str] = None
+
+
+class InvoiceListItem(OrmBase):
+    """Slim invoice row for paginated tables (Stage 3). Full detail stays on GET /{id}."""
+
+    id: str
+    invoice_number: str
+    invoice_type: str
+    ledger: str = "development"
+    client_id: str
+    client_name: Optional[str] = None
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    status: str
+    issue_date: date
+    due_date: date
+    subtotal_paise: int = 0
+    tax_paise: int = 0
+    total_paise: int = 0
+    amount_paid_paise: int = 0
+    balance_due_paise: int = 0
+    has_payment_proof: bool = False
+    email_status: str = "pending"
+    created_at: datetime
+    can_delete: bool = False
+    document_locked: bool = False
+    gst_enabled: bool = False
+
+
+class PaginationMetaSchema(BaseModel):
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class InvoiceMoneyTotalsSchema(BaseModel):
+    billed_paise: int = 0
+    paid_paise: int = 0
+    unpaid_paise: int = 0
+
+
+class InvoiceListResponse(BaseModel):
+    items: List[InvoiceListItem]
+    pagination: PaginationMetaSchema
+    status_counts: Optional[dict[str, int]] = None
+    money_totals: Optional[InvoiceMoneyTotalsSchema] = None
+
+
+class OptionItemSchema(BaseModel):
+    id: str
+    label: str
+    meta: dict = Field(default_factory=dict)
+
+
+class OptionsResponse(BaseModel):
+    items: List[OptionItemSchema]
+
+
+class ClientListResponse(BaseModel):
+    items: List[ClientResponse]
+    pagination: PaginationMetaSchema
+
+
+class LeadListResponse(BaseModel):
+    items: List[LeadResponse]
+    pagination: PaginationMetaSchema
+    status_counts: Optional[dict[str, int]] = None
+
 
 # ----------------- Recurring Invoices -----------------
 class RecurringInvoiceCreate(BaseModel):
