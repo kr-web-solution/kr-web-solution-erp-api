@@ -333,8 +333,13 @@ async def update_me(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Password must be at least 8 characters",
             )
-        current_pw = data.get("current_password") or ""
-        if current_pw and not verify_password(current_pw, current_user.password_hash):
+        current_pw = data.get("current_password")
+        if not current_pw or not str(current_pw).strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="current_password is required when changing password",
+            )
+        if not verify_password(str(current_pw), current_user.password_hash):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Current password is incorrect",

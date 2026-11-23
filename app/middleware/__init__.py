@@ -1,5 +1,7 @@
 import time
 import logging
+from typing import Optional
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -8,6 +10,32 @@ from starlette.responses import Response
 from ..core.config import settings
 
 logger = logging.getLogger("kr.api")
+
+# Arbitrary localhost ports — only when not in production. Production must list
+# origins explicitly in BACKEND_CORS_ORIGINS (including localhost if needed).
+LOCALHOST_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$"
+
+
+def cors_allow_origin_regex(
+    *,
+    production: bool,
+    environment: str = "development",
+) -> Optional[str]:
+    """Return localhost origin regex for non-production only.
+
+    Disables the regex when either ``PRODUCTION`` is true **or**
+    ``ENVIRONMENT`` is ``production`` (case-insensitive). These settings are
+    independent in config; relying on ``PRODUCTION`` alone would allow
+    localhost matching if ``ENVIRONMENT=production`` with ``PRODUCTION=false``.
+
+    In those production modes, only ``BACKEND_CORS_ORIGINS`` is consulted —
+    no wildcard localhost matching.
+    """
+    env = (environment or "").strip().lower()
+    if production or env == "production":
+        return None
+    return LOCALHOST_CORS_ORIGIN_REGEX
+
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
@@ -45,10 +73,11 @@ def register_middleware(app: FastAPI) -> None:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.BACKEND_CORS_ORIGINS,
-        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
+        allow_origin_regex=cors_allow_origin_regex(
+            production=settings.PRODUCTION,
+            environment=settings.ENVIRONMENT,
+        ),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-

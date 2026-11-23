@@ -15,9 +15,9 @@ Generated from live `APIRouter` mounts under `app/api/` and `app/routers/`.
 | POST | `/api/v1/auth/forgot-password` | none | public | Always generic message |
 | POST | `/api/v1/auth/google` | none | public | Invite-only; no auto-register |
 | POST | `/api/v1/auth/login` | none | public | Sets httpOnly cookie |
-| POST | `/api/v1/auth/logout` | none | public | Clears cookie even if unauthenticated |
+| POST | `/api/v1/auth/logout` | none | public | Clears auth cookie only; does **not** revoke a copied Bearer JWT (see `docs/DEPLOY_ENV.md` § Auth: logout vs JWT validity) |
 | GET | `/api/v1/auth/me` | get_current_user | any authenticated | Self profile |
-| PATCH | `/api/v1/auth/me` | get_current_user | any authenticated | Self name/password |
+| PATCH | `/api/v1/auth/me` | get_current_user | any authenticated | Self name/password; password change requires `current_password` |
 | PATCH | `/api/v1/auth/me/profile` | get_current_user | any authenticated | Self onboarding fields |
 | POST | `/api/v1/auth/microsoft` | none | public | Invite-only; no auto-register |
 | GET | `/api/v1/auth/oauth-providers` | none | public | Exposes OAuth client IDs only; secrets stay server-side |

@@ -97,6 +97,16 @@ class MeUpdate(BaseModel):
     password: Optional[str] = None
     current_password: Optional[str] = None
 
+    @model_validator(mode="after")
+    def require_current_password_when_changing(self) -> "MeUpdate":
+        """Password changes must prove possession of the current password."""
+        if self.password:
+            if not (self.current_password and str(self.current_password).strip()):
+                raise ValueError(
+                    "current_password is required when changing password"
+                )
+        return self
+
 
 class MeProfileUpdate(BaseModel):
     """Progressive onboarding fields after invite."""

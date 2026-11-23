@@ -20,6 +20,7 @@ from reportlab.platypus import (
     Image,
     Flowable,
     CondPageBreak,
+    KeepTogether,
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
@@ -103,9 +104,15 @@ _PARTIES_BG = colors.HexColor("#F8FAFC")
 _HAIRLINE = colors.HexColor("#CBD5E1")
 
 
+# Preview paper is drawn in CSS px at 96dpi; PDF uses typographic points (72dpi).
+# A4 short side: 794 CSS px ≈ 595 pt → multiply CSS px by 0.75 for true paper parity.
+# (Using 1:1 made landscape invoices ~33% too tall, pushing line items onto page 2.)
+_CSS_PX_TO_PT = 72.0 / 96.0
+
+
 def _px(n: float, scale: float = 1.0) -> float:
-    """Map preview CSS px → PDF points (1 CSS px ≈ 1 pt for A4 paper parity)."""
-    return float(n) * float(scale)
+    """Map preview CSS px (× --inv-scale) → PDF points."""
+    return float(n) * float(scale) * _CSS_PX_TO_PT
 
 _TYPE_LABELS = {
     "custom_dev": "Custom Development",
@@ -206,6 +213,27 @@ def _resolve_upi_qr_path(qr_url: Optional[str]) -> Optional[Path]:
     safe = Path(match.group(1)).name
     path = _UPLOADS_BRAND / safe
     return path if path.is_file() else None
+
+
+class _AtFrameTopSpacer(Flowable):
+    """Take vertical space only when starting near the top of a new page frame.
+
+    Used after CondPageBreak so page-2+ continued header chrome has room without
+    inserting a gap when the summary block still fits on page 1.
+    """
+
+    def __init__(self, height: float, min_avail: float):
+        Flowable.__init__(self)
+        self._height = float(height)
+        self._min_avail = float(min_avail)
+
+    def wrap(self, availWidth, availHeight):
+        if availHeight >= self._min_avail:
+            return availWidth, self._height
+        return availWidth, 0.0
+
+    def draw(self):
+        return
 
 
 def _type_label(invoice_type: Optional[str]) -> str:
@@ -352,11 +380,13 @@ def _draw_invoice_chrome(
         except Exception:
             pass
 
-    # Page 2+ continued header (matches InvoicePaperStage)
+    # Page 2+ continued header (matches InvoicePaperStage) — sits in content top band
     if page_num > 1:
         font_reg, font_bold = _invoice_fonts()
         band = float(getattr(doc, "_kr_continued_band", _px(36, scale)) or _px(36, scale))
-        top_y = page_h - max(10.0, band * 0.35)
+        # Content starts at page_h - topMargin; header occupies the spacer band below that.
+        content_top = page_h - float(doc.topMargin)
+        top_y = content_top - max(8.0, band * 0.28)
         mark_h = max(12.0, min(20.0, _px(18, scale)))
         text_x = doc.leftMargin
         if logo is not None:
@@ -374,7 +404,7 @@ def _draw_invoice_chrome(
             except Exception:
                 pass
         canvas.setFillColor(_PRIMARY)
-        canvas.setFont(font_bold, max(8.0, _px(10, scale)))
+        canvas.setFont(font_bold, max(9.0, _px(11, scale)))
         canvas.drawString(text_x, top_y, company_name)
         canvas.setFillColor(_MUTED)
         canvas.setFont(font_reg, max(7.0, _px(8.5, scale)))
@@ -389,7 +419,7 @@ def _draw_invoice_chrome(
             top_y,
             f"Page {page_num} of {page_count}",
         )
-        rule_y = top_y - _px(18, scale)
+        rule_y = content_top - band + 2.0
         canvas.setStrokeColor(_BORDER)
         canvas.setLineWidth(0.5)
         canvas.line(doc.leftMargin, rule_y, page_w - doc.rightMargin, rule_y)
@@ -541,13 +571,12 @@ def _generate_invoice_pdf_reportlab(
         doc_title_early = "INVOICE"
     pdf_meta_title = f"{doc_title_early} {invoice.invoice_number or ''}".strip()
 
-    # Match A4_TOKENS padX=32 / padY=28 / footerBand=40 (CSS px ≈ PDF pt).
-    # Extra top band reserved for page-2+ "Continued" header (drawn in chrome).
-    side_m = max(16.0, min(40.0, _px(32, scale)))
+    # Match A4_TOKENS padX=32 / padY=28 / footerBand≈40 (CSS px → pt).
+    side_m = max(14.0, _px(32, scale))
+    top_m = max(12.0, _px(28, scale))
+    bottom_m = max(24.0, _px(40, scale))
+    # Space reserved on page 2+ for continued header drawn in chrome.
     continued_band = _px(36, scale)
-    top_m = max(14.0, min(36.0, _px(28, scale))) + continued_band
-    bottom_m = max(32.0, min(52.0, _px(44, scale)))
-    doc_continued_band = continued_band
 
     doc = SimpleDocTemplate(
         buffer,
@@ -560,10 +589,10 @@ def _generate_invoice_pdf_reportlab(
         author=comp_name,
         subject=pdf_meta_title,
     )
-    doc._kr_continued_band = doc_continued_band
+    doc._kr_continued_band = continued_band
 
     def fs(base: float, lo: float = 6.0, hi: float = 28.0) -> float:
-        return max(lo, min(hi, base * scale))
+        return max(lo, min(hi, base * scale * _CSS_PX_TO_PT))
 
     styles = getSampleStyleSheet()
     # Preview base fontSize ≈ 11px
@@ -1118,8 +1147,6 @@ def _generate_invoice_pdf_reportlab(
         )
     )
     elements.append(items_table)
-    # A4_TOKENS.totalsMarginTop ≈ mt-6 (24px)
-    elements.append(Spacer(1, _px(24, scale)))
 
     # ——— Bank + totals ———
     tax_rate = float(invoice.tax_rate_percent or 0)
@@ -1454,9 +1481,13 @@ def _generate_invoice_pdf_reportlab(
     totals_stack = Table(right_stack_bits, colWidths=[tot_w])
     totals_stack.setStyle(TableStyle(stack_style))
 
-    # Match preview pagination: keep items on page 1; if payment/totals/terms
-    # won't fit in the remaining space, break before this block (page 2).
-    elements.append(CondPageBreak(max(160.0, 200.0 * scale)))
+    # Match preview sections: break before `totals` + `words-terms` when they
+    # won't fit after items (landscape A4 @ 1.35 often needs page 2).
+    page2_bits: list = []
+    frame_h = float(pagesize[1]) - top_m - bottom_m
+    page2_bits.append(_AtFrameTopSpacer(continued_band, min_avail=frame_h * 0.78))
+    # A4_TOKENS.totalsMarginTop ≈ mt-6 — belongs with totals, not after items on p1
+    page2_bits.append(Spacer(1, _px(24, scale)))
 
     if left_bank_bits:
         left_stack_data = [[bit] for bit in left_bank_bits]
@@ -1486,7 +1517,7 @@ def _generate_invoice_pdf_reportlab(
                 ]
             )
         )
-        elements.append(summary)
+        page2_bits.append(summary)
     else:
         wrap = Table([[totals_stack]], colWidths=[content_w])
         wrap.setStyle(
@@ -1498,7 +1529,7 @@ def _generate_invoice_pdf_reportlab(
                 ]
             )
         )
-        elements.append(wrap)
+        page2_bits.append(wrap)
 
     qr_path = (
         _resolve_upi_qr_path(pay.get("upi_qr_url")) if show_payment_instructions else None
@@ -1506,14 +1537,14 @@ def _generate_invoice_pdf_reportlab(
     if qr_path is not None and left_bank_bits:
         try:
             qr_size = max(0.7 * inch, min(1.1 * inch, 0.95 * inch * scale))
-            elements.append(Spacer(1, 6 * scale))
-            elements.append(Image(str(qr_path), width=qr_size, height=qr_size))
+            page2_bits.append(Spacer(1, 6 * scale))
+            page2_bits.append(Image(str(qr_path), width=qr_size, height=qr_size))
         except Exception:
             pass
 
     # A4_TOKENS.wordsMarginTop ≈ mt-4 (16px)
-    elements.append(Spacer(1, _px(16, scale)))
-    elements.append(
+    page2_bits.append(Spacer(1, _px(16, scale)))
+    page2_bits.append(
         Paragraph(
             f'<font size="{fs(10.5):.1f}" color="#172554"><b>Amount in words:</b></font> '
             f'<font size="{fs(10.5):.1f}" color="#334155">{amount_in_words_inr(invoice.total_paise)}</font>',
@@ -1522,7 +1553,7 @@ def _generate_invoice_pdf_reportlab(
     )
 
     # A4_TOKENS.termsMarginTop ≈ mt-7 (28px)
-    elements.append(Spacer(1, _px(28, scale)))
+    page2_bits.append(Spacer(1, _px(28, scale)))
 
     # ——— Terms ———
     term_lines = frozen_terms or resolve_invoice_terms(
@@ -1540,30 +1571,60 @@ def _generate_invoice_pdf_reportlab(
                 for i, line in enumerate(capped)
             )
         )
-        elements.append(Paragraph(terms_html, body))
+        page2_bits.append(Paragraph(terms_html, body))
+
+    # Estimate space needed for totals+words so CondPageBreak mirrors preview.
+    page2_need = max(180.0, 220.0 * scale)
+    elements.append(CondPageBreak(page2_need))
+    elements.append(KeepTogether(page2_bits))
 
     logo_url_frozen = getattr(settings, "company_logo_url", None) if settings else None
     footer_meta_bits = [comp_website or None, comp_email or None]
     doc._kr_footer_meta = " · ".join(b for b in footer_meta_bits if b)
 
-    def _on_page_live(canvas, doc_):
-        n = canvas.getPageNumber()
-        page_count_holder["n"] = max(page_count_holder["n"], n)
-        _draw_invoice_chrome(
-            canvas,
-            doc_,
-            status=status,
-            page_num=n,
-            page_count=page_count_holder["n"],
-            company_name=comp_name,
-            doc_title=doc_title,
-            invoice_number=str(invoice.invoice_number or ""),
-            pagesize=pagesize,
-            scale=scale,
-            logo_url=logo_url_frozen,
-        )
+    chrome_kw = dict(
+        status=status,
+        company_name=comp_name,
+        doc_title=doc_title,
+        invoice_number=str(invoice.invoice_number or ""),
+        pagesize=pagesize,
+        scale=scale,
+        logo_url=logo_url_frozen,
+    )
 
-    doc.build(elements, onFirstPage=_on_page_live, onLaterPages=_on_page_live)
+    class _InvoiceCanvas(pdfcanvas.Canvas):
+        """Defer chrome until save() so footer can show correct total page count."""
+
+        def __init__(self, *args, **kwargs):
+            pdfcanvas.Canvas.__init__(self, *args, **kwargs)
+            self._saved_page_states: list = []
+
+        def showPage(self):
+            self._saved_page_states.append(dict(self.__dict__))
+            self._startPage()
+
+        def save(self):
+            total = len(self._saved_page_states) or 1
+            page_count_holder["n"] = total
+            for idx, state in enumerate(self._saved_page_states):
+                self.__dict__.update(state)
+                _draw_invoice_chrome(
+                    self,
+                    doc,
+                    page_num=idx + 1,
+                    page_count=total,
+                    **chrome_kw,
+                )
+                pdfcanvas.Canvas.showPage(self)
+            pdfcanvas.Canvas.save(self)
+
+    # onPage is a no-op; chrome is stamped in _InvoiceCanvas.save with known totals.
+    doc.build(
+        elements,
+        onFirstPage=lambda *_: None,
+        onLaterPages=lambda *_: None,
+        canvasmaker=_InvoiceCanvas,
+    )
     buffer.seek(0)
     return buffer.getvalue()
 

@@ -27,7 +27,9 @@ Names only — never commit real secrets. Assumes Dokploy (or similar) builds th
 | `ENVIRONMENT` | `production` for live; `development` / `local` / `test` for non-prod |
 | `PRODUCTION` | `true` on live |
 | `FRONTEND_URL` | UI origin |
-| `BACKEND_CORS_ORIGINS` | JSON list of allowed origins |
+| `BACKEND_CORS_ORIGINS` | JSON list of allowed origins. In production, **only** this allowlist is used (no automatic localhost regex). Non-production also allows `http(s)://localhost` / `127.0.0.1` on any port via regex. |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | JWT / cookie lifetime (default `1440` = 24h) |
+| `COOKIE_NAME` | Auth cookie name (default `kr_access_token`) |
 | `ENABLE_SCHEDULER` | Optional `true`/`false`; default **on only when** `ENVIRONMENT=production` |
 | `SUPER_ADMIN_EMAIL` / `SUPER_ADMIN_PASSWORD` / `SUPER_ADMIN_NAME` | First-boot admin via CLI only |
 | `SMTP_*` / `BILLING_*` | Optional outbound mail |
@@ -89,6 +91,18 @@ Local DBs must be localhost (or `.local`) **and** either a `*test*` / `*pytest*`
 | `ENABLE_SCHEDULER` unset and `ENVIRONMENT` ≠ `production` | Off |
 | Non-production + non-local `DATABASE_URL` host | Off (even if `ENABLE_SCHEDULER=true`) |
 | `ENVIRONMENT=production` (or explicit `ENABLE_SCHEDULER=true` on local) | On |
+
+## Auth: logout vs JWT validity
+
+Login issues a signed JWT (`ACCESS_TOKEN_EXPIRE_MINUTES`, default 1440 minutes) and sets it as an httpOnly cookie (`COOKIE_NAME`). Clients may also send the same value as `Authorization: Bearer <token>`.
+
+| Action | Effect |
+|--------|--------|
+| `POST /api/v1/auth/logout` | Deletes the auth **cookie** on the browser (same path / SameSite / Secure flags as login). |
+| Copied Bearer JWT | **Not** invalidated. Anyone who already copied the token can keep using it until it expires. |
+| Token denylist / rotation | **Not** implemented. Server-side revocation would be a separate architectural decision (e.g. Redis denylist, refresh-token rotation). |
+
+**Why this is acceptable for Stage 1:** HttpOnly cookies prevent JavaScript from directly reading the authentication cookie, reducing the risk of token exfiltration. However, HttpOnly does not prevent malicious scripts executing through an XSS vulnerability from making authenticated requests using the browser's cookie. Token expiry limits the lifetime of a copied JWT, but logout does not revoke previously copied Bearer tokens.
 
 ## Tests
 

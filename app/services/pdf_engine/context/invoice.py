@@ -44,11 +44,15 @@ def _split_description(description: str) -> tuple[str, Optional[str]]:
     return parts[0], " ".join(parts[1:])
 
 
-def _scale_for_key(paper_key: str) -> float:
+# Preview CSS px @ 96dpi → PDF pt @ 72dpi (same as reportlab pdf._CSS_PX_TO_PT).
+_CSS_PX_TO_PT = 72.0 / 96.0
+
+
+def _scale_for_pagesize(pagesize: tuple[float, float]) -> float:
+    """Match preview contentScale: clamp(pageWidth / A4portraitWidth, 0.78, 1.35)."""
     from reportlab.lib.pagesizes import A4
 
-    _, pagesize = resolve_paper_size(paper_key, "portrait")
-    return max(0.78, min(1.35, pagesize[0] / A4[0]))
+    return max(0.78, min(1.35, float(pagesize[0]) / float(A4[0])))
 
 
 _STATUS_BADGE = {
@@ -79,20 +83,6 @@ def _fmt_date(value: Any) -> str:
         return value.strftime("%d %b %Y")
     except Exception:
         return str(value)
-
-
-def _split_description(description: str) -> tuple[str, Optional[str]]:
-    parts = [p.strip() for p in (description or "").split("\n") if p.strip()]
-    if len(parts) <= 1:
-        return (description or "").strip() or "—", None
-    return parts[0], " ".join(parts[1:])
-
-
-def _scale_for_key(paper_key: str) -> float:
-    from reportlab.lib.pagesizes import A4
-
-    _, pagesize = resolve_paper_size(paper_key, "portrait")
-    return max(0.78, min(1.35, pagesize[0] / A4[0]))
 
 
 def _jinja_env() -> Environment:
@@ -153,7 +143,7 @@ def build_invoice_context(
             )
 
     paper_key, pagesize = resolve_paper_size(paper_size, orientation)
-    scale = _scale_for_key(paper_key)
+    scale = _scale_for_pagesize(pagesize)
     landscape = pagesize[0] > pagesize[1]
     page_css = _PAGE_CSS.get(paper_key, "A4")
     if landscape and paper_key in {"a3", "a4", "a5", "a6", "b4", "b5"}:
@@ -472,7 +462,8 @@ def build_invoice_context(
     )
 
     def fs(base: float) -> float:
-        return round(max(6.0, min(28.0, base * scale)), 1)
+        # CSS px × inv-scale → pt (96dpi → 72dpi)
+        return round(max(6.0, min(28.0, base * scale * _CSS_PX_TO_PT)), 1)
 
     footer_meta = " · ".join(b for b in [comp_website or None, comp_email or None] if b)
 
