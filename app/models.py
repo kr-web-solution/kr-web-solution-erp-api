@@ -1537,3 +1537,31 @@ class AuditLog(Base):
 
     actor: Mapped[Optional["User"]] = relationship("User", foreign_keys=[actor_id])
 
+
+class PdfTemplate(TimestampMixin, Base):
+    """
+    Registry of filesystem PDF designs (metadata only — HTML stays on disk).
+    Activating a design does not rewrite historically issued invoice snapshots.
+    """
+
+    __tablename__ = "pdf_templates"
+    __table_args__ = (
+        UniqueConstraint(
+            "doc_type", "design_key", "version", name="uq_pdf_templates_doc_design_ver"
+        ),
+        Index("ix_pdf_templates_doc_active", "doc_type", "active"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: f"pdt_{uuid.uuid4().hex[:10]}",
+        index=True,
+    )
+    doc_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    design_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    version: Mapped[str] = mapped_column(String(20), nullable=False, default="v1")
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+

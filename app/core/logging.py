@@ -11,7 +11,14 @@ def configure_logging() -> None:
         force=True,
     )
     # Enable all access and application loggers
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "kr.api", "fastapi"):
+    for name in (
+        "uvicorn",
+        "uvicorn.error",
+        "uvicorn.access",
+        "kr.api",
+        "kr.pdf",
+        "fastapi",
+    ):
         lg = logging.getLogger(name)
         lg.setLevel(level)
         lg.disabled = False

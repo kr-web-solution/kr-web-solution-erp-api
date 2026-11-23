@@ -12,13 +12,17 @@ from app.services.scheduler import start_scheduler, stop_scheduler, log_schedule
 async def lifespan(app: FastAPI):
     configure_logging()
     from app.services.object_storage import ensure_buckets
+    from app.services.pdf_engine import cleanup_temp_pdfs
+
     ensure_buckets()
+    cleanup_temp_pdfs()
     # Production/deploy: schema via alembic one-off; data via CLI only (not on startup).
     await init_db()
     log_scheduler_startup_status()
     start_scheduler()
     yield
     stop_scheduler()
+    cleanup_temp_pdfs()
 
 def create_application() -> FastAPI:
     application = FastAPI(

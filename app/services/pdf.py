@@ -19,6 +19,7 @@ from reportlab.platypus import (
     TableStyle,
     Image,
     Flowable,
+    CondPageBreak,
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
@@ -318,12 +319,28 @@ def _draw_invoice_chrome(
     logo = _logo_path(logo_url)
     if logo is not None:
         try:
-            img = ImageReader(str(logo))
+            # Grayscale watermark to match InvoiceSheetChrome (filter: grayscale)
+            wm_reader: ImageReader
+            try:
+                from PIL import Image as PILImage
+                from PIL import ImageOps
+
+                with PILImage.open(str(logo)) as pil_img:
+                    rgba = pil_img.convert("RGBA")
+                    alpha = rgba.getchannel("A")
+                    gray_rgb = ImageOps.grayscale(rgba).convert("RGBA")
+                    gray_rgb.putalpha(alpha)
+                    buf = io.BytesIO()
+                    gray_rgb.save(buf, format="PNG")
+                    buf.seek(0)
+                    wm_reader = ImageReader(buf)
+            except Exception:
+                wm_reader = ImageReader(str(logo))
             # Match A4_TOKENS: watermarkSize 42%, max 280px, opacity 0.045
             size = min(page_w * 0.42, _px(280, scale))
             canvas.setFillAlpha(0.045)
             canvas.drawImage(
-                img,
+                wm_reader,
                 (page_w - size) / 2.0,
                 (page_h - size) / 2.0,
                 width=size,
@@ -334,6 +351,48 @@ def _draw_invoice_chrome(
             canvas.setFillAlpha(1.0)
         except Exception:
             pass
+
+    # Page 2+ continued header (matches InvoicePaperStage)
+    if page_num > 1:
+        font_reg, font_bold = _invoice_fonts()
+        band = float(getattr(doc, "_kr_continued_band", _px(36, scale)) or _px(36, scale))
+        top_y = page_h - max(10.0, band * 0.35)
+        mark_h = max(12.0, min(20.0, _px(18, scale)))
+        text_x = doc.leftMargin
+        if logo is not None:
+            try:
+                canvas.drawImage(
+                    ImageReader(str(logo)),
+                    doc.leftMargin,
+                    top_y - mark_h * 0.15,
+                    width=mark_h,
+                    height=mark_h,
+                    mask="auto",
+                    preserveAspectRatio=True,
+                )
+                text_x = doc.leftMargin + mark_h + _px(6, scale)
+            except Exception:
+                pass
+        canvas.setFillColor(_PRIMARY)
+        canvas.setFont(font_bold, max(8.0, _px(10, scale)))
+        canvas.drawString(text_x, top_y, company_name)
+        canvas.setFillColor(_MUTED)
+        canvas.setFont(font_reg, max(7.0, _px(8.5, scale)))
+        canvas.drawString(
+            text_x,
+            top_y - _px(12, scale),
+            f"Invoice {invoice_number} · Continued",
+        )
+        canvas.setFont(font_reg, max(7.0, _px(9, scale)))
+        canvas.drawRightString(
+            page_w - doc.rightMargin,
+            top_y,
+            f"Page {page_num} of {page_count}",
+        )
+        rule_y = top_y - _px(18, scale)
+        canvas.setStrokeColor(_BORDER)
+        canvas.setLineWidth(0.5)
+        canvas.line(doc.leftMargin, rule_y, page_w - doc.rightMargin, rule_y)
 
     # Footer band ≈ A4_TOKENS.footerBandPx (40)
     footer_band = _px(40, scale)
@@ -483,9 +542,12 @@ def _generate_invoice_pdf_reportlab(
     pdf_meta_title = f"{doc_title_early} {invoice.invoice_number or ''}".strip()
 
     # Match A4_TOKENS padX=32 / padY=28 / footerBand=40 (CSS px ≈ PDF pt).
+    # Extra top band reserved for page-2+ "Continued" header (drawn in chrome).
     side_m = max(16.0, min(40.0, _px(32, scale)))
-    top_m = max(14.0, min(36.0, _px(28, scale)))
+    continued_band = _px(36, scale)
+    top_m = max(14.0, min(36.0, _px(28, scale))) + continued_band
     bottom_m = max(32.0, min(52.0, _px(44, scale)))
+    doc_continued_band = continued_band
 
     doc = SimpleDocTemplate(
         buffer,
@@ -498,6 +560,7 @@ def _generate_invoice_pdf_reportlab(
         author=comp_name,
         subject=pdf_meta_title,
     )
+    doc._kr_continued_band = doc_continued_band
 
     def fs(base: float, lo: float = 6.0, hi: float = 28.0) -> float:
         return max(lo, min(hi, base * scale))
@@ -963,6 +1026,13 @@ def _generate_invoice_pdf_reportlab(
             )
         else:
             desc_html = f"<b>{desc}</b>"
+        kind_raw = (getattr(itm, "line_kind", None) or "").strip()
+        if kind_raw:
+            kind_lbl = (_type_label(kind_raw) or kind_raw.replace("_", " ")).upper()
+            desc_html += (
+                f"<br/><font color='#64748B' size='{fs(8.5):.1f}'>"
+                f"{kind_lbl}</font>"
+            )
         row = [
             Paragraph(str(idx), td_muted),
             Paragraph(desc_html, td),
@@ -1286,8 +1356,15 @@ def _generate_invoice_pdf_reportlab(
                 bits.append(str(p.method).replace("_", " ").title())
             bits.append(format_inr(int(getattr(p, "amount_paise", 0) or 0)))
             ref = (getattr(p, "reference", None) or "").strip()
-            if ref:
-                bits.append(f"UTR/Ref: {ref}")
+            note = (getattr(p, "note", None) or "").strip()
+            # Avoid duplicating UTR when note already contains the reference text
+            if ref and note and ref in note:
+                bits.append(note)
+            else:
+                if ref:
+                    bits.append(f"UTR/Ref: {ref}")
+                if note:
+                    bits.append(note)
             conf_lines.append(
                 f'<font size="{fs(7.5):.1f}" color="#64748B">{" · ".join(bits)}</font>'
             )
@@ -1376,6 +1453,10 @@ def _generate_invoice_pdf_reportlab(
         stack_style.append(("TOPPADDING", (0, 2), (-1, 2), 4))
     totals_stack = Table(right_stack_bits, colWidths=[tot_w])
     totals_stack.setStyle(TableStyle(stack_style))
+
+    # Match preview pagination: keep items on page 1; if payment/totals/terms
+    # won't fit in the remaining space, break before this block (page 2).
+    elements.append(CondPageBreak(max(160.0, 200.0 * scale)))
 
     if left_bank_bits:
         left_stack_data = [[bit] for bit in left_bank_bits]
@@ -1499,8 +1580,70 @@ def generate_payslip_pdf(
     net_paise: int,
     note: Optional[str],
     company_name: str,
+    company_address: Optional[str] = None,
+    company_logo_url: Optional[str] = None,
+    paper_size: Optional[str] = None,
+    orientation: Optional[str] = None,
 ) -> bytes:
     """Simple earnings / deductions / net payslip (no PF/ESI/TDS)."""
+    try:
+        from .pdf_engine.context.payslip import build_payslip_context
+        from .pdf_engine.service import render_document_sync
+
+        ctx = build_payslip_context(
+            employee_name=employee_name,
+            employee_email=employee_email,
+            job_title=job_title,
+            department=department,
+            month_key=month_key,
+            gross_paise=gross_paise,
+            deductions_paise=deductions_paise,
+            net_paise=net_paise,
+            note=note,
+            company_name=company_name,
+            company_address=company_address,
+            company_logo_url=company_logo_url,
+            paper_size=paper_size or "a4",
+            orientation=orientation or "portrait",
+        )
+        return render_document_sync(
+            "payslip",
+            ctx,
+            paper_size=paper_size or "a4",
+            orientation=orientation or "portrait",
+        )
+    except Exception as exc:
+        logger.warning(
+            "WeasyPrint payslip PDF unavailable (%s); using ReportLab fallback",
+            exc,
+        )
+    return _generate_payslip_pdf_reportlab(
+        employee_name=employee_name,
+        employee_email=employee_email,
+        job_title=job_title,
+        department=department,
+        month_key=month_key,
+        gross_paise=gross_paise,
+        deductions_paise=deductions_paise,
+        net_paise=net_paise,
+        note=note,
+        company_name=company_name,
+    )
+
+
+def _generate_payslip_pdf_reportlab(
+    *,
+    employee_name: str,
+    employee_email: str,
+    job_title: Optional[str],
+    department: Optional[str],
+    month_key: str,
+    gross_paise: int,
+    deductions_paise: int,
+    net_paise: int,
+    note: Optional[str],
+    company_name: str,
+) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,

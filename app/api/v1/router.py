@@ -12,6 +12,7 @@ from ...routers.engagements import router as engagements_router
 from ...routers.staff import router as staff_router
 from ...routers.company_expenses import router as company_expenses_router
 from ...routers.audit_logs import router as audit_logs_router
+from ...routers.pdf import router as pdf_router
 
 v1_router = APIRouter(prefix="/v1")
 
@@ -28,3 +29,4 @@ v1_router.include_router(engagements_router)
 v1_router.include_router(staff_router)
 v1_router.include_router(company_expenses_router)
 v1_router.include_router(audit_logs_router)
+v1_router.include_router(pdf_router)
